@@ -1,0 +1,16 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "hermes-bridge",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-05-05",
+  "compatibility_flags": ["nodejs_compat"],
+  "routes": [
+    { "pattern": "hermes.YOUR-DOMAIN.com/*", "custom_domain": true }
+  ],
+  "kv_namespaces": [
+    {
+      "binding": "HERMES_CONTEXT",
+      "id": "REPLACE_AFTER_WRANGLER_KV_NAMESPACE_CREATE"
+    }
+  ]
+}
