@@ -3,6 +3,8 @@ import worker, {
   verifyHmacSignature,
   handlePrecall,
   handleHermesPush,
+  handleTranscript,
+  handleHermesPullTranscripts,
   type Env,
 } from './index'
 
@@ -221,6 +223,152 @@ describe('handleHermesPush', () => {
   })
 })
 
+describe('handleTranscript', () => {
+  let env: Env
+
+  beforeEach(() => {
+    env = createEnv()
+  })
+
+  function transcriptPayload(callId: string): string {
+    return JSON.stringify({
+      callId,
+      duration: 53,
+      transcript: [
+        { role: 'ai', text: 'Hey, what do you want to dig into?', timestamp: '2026-05-12T00:00:00Z' },
+        { role: 'human', text: 'Walk me through this morning.', timestamp: '2026-05-12T00:00:05Z' },
+      ],
+      summary: {
+        summary: 'David wanted a walkthrough of the morning brief.',
+        callerName: 'David',
+        intent: 'general_inquiry',
+        urgency: 'medium',
+        callbackBy: null,
+        spam: false,
+      },
+    })
+  }
+
+  it('queues a transcript on valid HMAC', async () => {
+    const body = transcriptPayload('call_1')
+    const sig = await hmac(body, SIGNING_SECRET)
+    const req = new Request('https://hermes.agentcall.co/agentcall/transcript', {
+      method: 'POST',
+      headers: { 'X-AgentCall-Signature': sig, 'Content-Type': 'application/json' },
+      body,
+    })
+    const res = await handleTranscript(req, env)
+    expect(res.status).toBe(200)
+    const json = (await res.json()) as { status: string; queueDepth: number }
+    expect(json.status).toBe('queued')
+    expect(json.queueDepth).toBe(1)
+  })
+
+  it('appends transcripts in FIFO order without overwriting', async () => {
+    for (const id of ['a', 'b', 'c']) {
+      const body = transcriptPayload(id)
+      const sig = await hmac(body, SIGNING_SECRET)
+      const req = new Request('https://hermes.agentcall.co/agentcall/transcript', {
+        method: 'POST',
+        headers: { 'X-AgentCall-Signature': sig },
+        body,
+      })
+      const res = await handleTranscript(req, env)
+      expect(res.status).toBe(200)
+    }
+    const stored = await env.HERMES_CONTEXT.get('transcript_queue')
+    const queue = JSON.parse(stored!) as Array<{ callId: string }>
+    expect(queue.map((t) => t.callId)).toEqual(['a', 'b', 'c'])
+  })
+
+  it('rejects an invalid HMAC signature', async () => {
+    const req = new Request('https://hermes.agentcall.co/agentcall/transcript', {
+      method: 'POST',
+      headers: { 'X-AgentCall-Signature': 'sha256=0000' },
+      body: transcriptPayload('call_1'),
+    })
+    const res = await handleTranscript(req, env)
+    expect(res.status).toBe(401)
+    expect(await env.HERMES_CONTEXT.get('transcript_queue')).toBeNull()
+  })
+
+  it('rejects invalid JSON even with valid HMAC', async () => {
+    const body = 'not json'
+    const sig = await hmac(body, SIGNING_SECRET)
+    const req = new Request('https://hermes.agentcall.co/agentcall/transcript', {
+      method: 'POST',
+      headers: { 'X-AgentCall-Signature': sig },
+      body,
+    })
+    const res = await handleTranscript(req, env)
+    expect(res.status).toBe(400)
+  })
+
+  it('caps the queue at 100 entries and drops oldest', async () => {
+    const existing = Array.from({ length: 100 }, (_, i) => ({ callId: `old_${i}` }))
+    await env.HERMES_CONTEXT.put('transcript_queue', JSON.stringify(existing))
+    const body = transcriptPayload('newest')
+    const sig = await hmac(body, SIGNING_SECRET)
+    const req = new Request('https://hermes.agentcall.co/agentcall/transcript', {
+      method: 'POST',
+      headers: { 'X-AgentCall-Signature': sig },
+      body,
+    })
+    const res = await handleTranscript(req, env)
+    expect(res.status).toBe(200)
+    const stored = await env.HERMES_CONTEXT.get('transcript_queue')
+    const queue = JSON.parse(stored!) as Array<{ callId: string }>
+    expect(queue.length).toBe(100)
+    expect(queue[0].callId).toBe('old_1') // oldest was dropped
+    expect(queue[99].callId).toBe('newest')
+  })
+})
+
+describe('handleHermesPullTranscripts', () => {
+  let env: Env
+
+  beforeEach(() => {
+    env = createEnv()
+  })
+
+  it('returns and clears the queue with valid push key', async () => {
+    const seed = [{ callId: 'a' }, { callId: 'b' }]
+    await env.HERMES_CONTEXT.put('transcript_queue', JSON.stringify(seed))
+    const req = new Request('https://hermes.agentcall.co/hermes/pull-transcripts', {
+      method: 'POST',
+      headers: { 'X-Hermes-Push-Key': PUSH_KEY },
+    })
+    const res = await handleHermesPullTranscripts(req, env)
+    expect(res.status).toBe(200)
+    const json = (await res.json()) as { transcripts: Array<{ callId: string }>; count: number }
+    expect(json.count).toBe(2)
+    expect(json.transcripts.map((t) => t.callId)).toEqual(['a', 'b'])
+    const stored = await env.HERMES_CONTEXT.get('transcript_queue')
+    expect(stored).toBe('[]')
+  })
+
+  it('returns empty array when queue is unset', async () => {
+    const req = new Request('https://hermes.agentcall.co/hermes/pull-transcripts', {
+      method: 'POST',
+      headers: { 'X-Hermes-Push-Key': PUSH_KEY },
+    })
+    const res = await handleHermesPullTranscripts(req, env)
+    expect(res.status).toBe(200)
+    const json = (await res.json()) as { transcripts: unknown[]; count: number }
+    expect(json.count).toBe(0)
+    expect(json.transcripts).toEqual([])
+  })
+
+  it('rejects without push key', async () => {
+    await env.HERMES_CONTEXT.put('transcript_queue', JSON.stringify([{ callId: 'should_not_leak' }]))
+    const req = new Request('https://hermes.agentcall.co/hermes/pull-transcripts', { method: 'POST' })
+    const res = await handleHermesPullTranscripts(req, env)
+    expect(res.status).toBe(401)
+    // Queue remains intact after a rejected pull
+    expect(await env.HERMES_CONTEXT.get('transcript_queue')).toBe(JSON.stringify([{ callId: 'should_not_leak' }]))
+  })
+})
+
 describe('worker.fetch (routing)', () => {
   let env: Env
 
@@ -244,6 +392,63 @@ describe('worker.fetch (routing)', () => {
     const req = new Request('https://hermes.agentcall.co/agentcall/precall')
     const res = await worker.fetch(req, env)
     expect(res.status).toBe(404)
+  })
+
+  it('routes POST /agentcall/transcript to handleTranscript', async () => {
+    const body = JSON.stringify({ callId: 'call_route', duration: 1, transcript: [], summary: null })
+    const sig = await hmac(body, SIGNING_SECRET)
+    const req = new Request('https://hermes.agentcall.co/agentcall/transcript', {
+      method: 'POST',
+      headers: { 'X-AgentCall-Signature': sig },
+      body,
+    })
+    const res = await worker.fetch(req, env)
+    expect(res.status).toBe(200)
+  })
+
+  it('routes POST /hermes/pull-transcripts to handleHermesPullTranscripts', async () => {
+    const req = new Request('https://hermes.agentcall.co/hermes/pull-transcripts', {
+      method: 'POST',
+      headers: { 'X-Hermes-Push-Key': PUSH_KEY },
+    })
+    const res = await worker.fetch(req, env)
+    expect(res.status).toBe(200)
+  })
+
+  it('end-to-end post-call loop: AgentCall pushes transcript → Hermes pulls → queue empty', async () => {
+    // AgentCall pushes a transcript
+    const body = JSON.stringify({
+      callId: 'call_e2e',
+      duration: 42,
+      transcript: [{ role: 'ai', text: 'hello' }],
+      summary: { summary: 'Hello.', callerName: null, intent: 'general_inquiry', urgency: 'low', callbackBy: null, spam: false },
+    })
+    const sig = await hmac(body, SIGNING_SECRET)
+    const pushReq = new Request('https://hermes.agentcall.co/agentcall/transcript', {
+      method: 'POST',
+      headers: { 'X-AgentCall-Signature': sig },
+      body,
+    })
+    expect((await worker.fetch(pushReq, env)).status).toBe(200)
+
+    // Hermes pulls
+    const pullReq = new Request('https://hermes.agentcall.co/hermes/pull-transcripts', {
+      method: 'POST',
+      headers: { 'X-Hermes-Push-Key': PUSH_KEY },
+    })
+    const pullRes = await worker.fetch(pullReq, env)
+    expect(pullRes.status).toBe(200)
+    const json = (await pullRes.json()) as { transcripts: Array<{ callId: string }>; count: number }
+    expect(json.count).toBe(1)
+    expect(json.transcripts[0].callId).toBe('call_e2e')
+
+    // Second pull is empty (queue was drained)
+    const pullAgain = new Request('https://hermes.agentcall.co/hermes/pull-transcripts', {
+      method: 'POST',
+      headers: { 'X-Hermes-Push-Key': PUSH_KEY },
+    })
+    const empty = await worker.fetch(pullAgain, env)
+    expect(((await empty.json()) as { count: number }).count).toBe(0)
   })
 
   it('end-to-end: Hermes pushes → AgentCall fetches → contextBlock matches', async () => {

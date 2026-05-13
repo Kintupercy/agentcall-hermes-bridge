@@ -1,17 +1,27 @@
 # agentcall-hermes-bridge
 
-A small Cloudflare Worker that lets you call your AI agent on the phone and have it speak with today's context loaded.
+A small Cloudflare Worker that closes the loop between AgentCall phone numbers and your AI agent. Pre-call: serves today's brief so the AI answers with fresh context. Post-call: queues the transcript so your agent can absorb what was decided on the call.
 
-Drop-in template. Deploy on your own Cloudflare account, point your AgentCall number's `contextWebhook` at it, and have your agent (Hermes, or any agent platform you run) push briefs to it on a schedule.
+Drop-in template. Deploy on your own Cloudflare account, point your AgentCall number's `contextWebhook` at it, register a `call.transcript` webhook for the transcript queue, and have your agent (Hermes, or any agent platform you run) push briefs in and pull transcripts out on a schedule.
 
-Walkthrough with screenshots and Telegram-prompt examples: **https://agentcall.co/docs/hermes**
+Walkthroughs with screenshots and Telegram-prompt examples:
+
+- Pre-call context: **https://agentcall.co/docs/hermes**
+- Post-call transcripts: **https://agentcall.co/docs/post-call-webhook**
 
 ## What it does
 
-Two endpoints, one always-on Cloudflare KV store:
+Four endpoints, one always-on Cloudflare KV store:
 
-- `POST /agentcall/precall` — AgentCall hits this on every inbound call. Verifies an HMAC signature, reads the latest brief from KV, returns `{contextBlock}` so AgentCall can merge it onto the system prompt before the AI answers.
+### Pre-call (brief in)
 - `POST /hermes/push` — your agent platform hits this whenever a new brief is ready. Auth via `X-Hermes-Push-Key` header. Stores the brief in KV (latest wins, 5000-char cap).
+- `POST /agentcall/precall` — AgentCall hits this on every inbound call. Verifies an HMAC signature, reads the latest brief from KV, returns `{contextBlock}` so AgentCall can merge it onto the system prompt before the AI answers.
+
+### Post-call (transcript out)
+- `POST /agentcall/transcript` — AgentCall hits this after every inbound AI call ends with the full transcript and an LLM-extracted summary. Verifies an HMAC signature, appends to a bounded FIFO queue in KV (max 100, oldest dropped if your agent stops pulling).
+- `POST /hermes/pull-transcripts` — your agent platform polls this to drain the queue. Same `X-Hermes-Push-Key` header auth. Returns all queued entries and atomically clears them so the next pull is empty until new transcripts arrive.
+
+### Health
 - `GET /healthz` — liveness probe.
 
 ## Why a bridge?
@@ -82,13 +92,28 @@ Then call the number. The AI should answer with the test context loaded. Full wa
 
 Neither secret is in the code or config. Both are Cloudflare Worker secrets set via `wrangler secret put`.
 
+## Drain transcripts on your agent side
+
+Once you've wired the post-call webhook on AgentCall (`call.transcript` event pointed at `https://hermes.your-domain.com/agentcall/transcript`), have your local agent platform pull the queue on a schedule:
+
+```bash
+# Cron or background loop on your agent's host
+curl -X POST https://hermes.your-domain.com/hermes/pull-transcripts \
+  -H "X-Hermes-Push-Key: hpk_xxx" \
+  | jq '.transcripts[]'
+```
+
+Each entry in `transcripts` is the full `call.transcript` payload AgentCall fires (callId, duration, transcript array, summary). The pull is read-and-clear, so persist locally before processing or you'll lose entries on the next pull.
+
+Cadence is up to you. Every minute is fine for low call volume; every 10 seconds if you want near-real-time follow-up. The bridge holds up to 100 transcripts between pulls, so polling every 5 minutes also works.
+
 ## Tests
 
 ```bash
 npm test
 ```
 
-21 unit tests cover HMAC verification, both endpoints, end-to-end push → fetch, and failure modes (missing signature, bad key, malformed JSON, oversize body).
+32 unit tests cover HMAC verification, all four endpoints, end-to-end push/pull loops for both pre-call and post-call, and failure modes (missing signature, bad key, malformed JSON, queue overflow, oversize body).
 
 ## License
 
