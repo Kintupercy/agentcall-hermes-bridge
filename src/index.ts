@@ -111,6 +111,14 @@ export async function handleTranscript(request: Request, env: Env): Promise<Resp
   }
   const stored = await env.HERMES_CONTEXT.get(TRANSCRIPT_QUEUE_KEY)
   const queue: unknown[] = stored ? safeParseArray(stored) : []
+  // Dedup on callId. AgentCall's webhook worker retries up to 5 times on any
+  // non-2xx response, so a transient KV write blip would cause the same call
+  // to land in the queue more than once. Returning 200 + status:'duplicate'
+  // tells the worker the delivery succeeded so it stops retrying.
+  const incomingCallId = extractCallId(parsed)
+  if (incomingCallId && queue.some((item) => extractCallId(item) === incomingCallId)) {
+    return jsonResponse({ status: 'duplicate', callId: incomingCallId, queueDepth: queue.length })
+  }
   queue.push(parsed)
   // Bounded FIFO: drop oldest if Hermes hasn't pulled in a while. Prevents the
   // KV value from growing without bound during a Hermes outage. Cloudflare KV
@@ -120,6 +128,16 @@ export async function handleTranscript(request: Request, env: Env): Promise<Resp
   }
   await env.HERMES_CONTEXT.put(TRANSCRIPT_QUEUE_KEY, JSON.stringify(queue))
   return jsonResponse({ status: 'queued', queueDepth: queue.length })
+}
+
+function extractCallId(envelope: unknown): string | null {
+  if (!envelope || typeof envelope !== 'object') return null
+  const env = envelope as { data?: { callId?: unknown }; callId?: unknown }
+  if (env.data && typeof env.data === 'object' && typeof env.data.callId === 'string') {
+    return env.data.callId
+  }
+  if (typeof env.callId === 'string') return env.callId
+  return null
 }
 
 export async function handleHermesPullTranscripts(request: Request, env: Env): Promise<Response> {
