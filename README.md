@@ -107,6 +107,41 @@ Each entry in `transcripts` is the full `call.transcript` payload AgentCall fire
 
 Cadence is up to you. Every minute is fine for low call volume; every 10 seconds if you want near-real-time follow-up. The bridge holds up to 100 transcripts between pulls, so polling every 5 minutes also works.
 
+### Heads up for Python-based brains
+
+Cloudflare blocks Python's default `urllib` User-Agent on this bridge with HTTP 403 (Error 1010, `browser_signature_banned`). The `/hermes/pull-transcripts` route will silently 403 every poll, your queue accumulates, and your loop may still log success on whatever wrapper you're using.
+
+Two ways to fix it:
+
+```python
+# Option 1: shell out to curl
+import subprocess, json
+result = subprocess.run(
+    ["curl", "-s", "-X", "POST",
+     "https://hermes.your-domain.com/hermes/pull-transcripts",
+     "-H", "X-Hermes-Push-Key: hpk_xxx"],
+    capture_output=True, text=True, check=True,
+)
+transcripts = json.loads(result.stdout)["transcripts"]
+```
+
+```python
+# Option 2: override the urllib User-Agent
+import urllib.request, json
+req = urllib.request.Request(
+    "https://hermes.your-domain.com/hermes/pull-transcripts",
+    method="POST",
+    headers={
+        "X-Hermes-Push-Key": "hpk_xxx",
+        "User-Agent": "curl/8.0",
+    },
+)
+with urllib.request.urlopen(req) as resp:
+    transcripts = json.loads(resp.read())["transcripts"]
+```
+
+Node, Go, Rust, `requests`, `httpx`, and curl-based clients send their own User-Agent and are unaffected. Only Python's stdlib default (`Python-urllib/3.x`) trips the rule.
+
 ## Tests
 
 ```bash
