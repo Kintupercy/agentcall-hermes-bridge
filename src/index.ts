@@ -44,7 +44,10 @@ const KV_KEY = 'current'
 const TRANSCRIPT_QUEUE_PREFIX = 'transcript_queue:'
 const DEFAULT_TENANT = 'default'
 const PULL_LOCK_KEY = 'transcript_queue_pull_lock'
-const PULL_LOCK_TTL_SECONDS = 30
+// Cloudflare KV rejects any `expirationTtl` below 60 seconds and throws,
+// which would crash the whole pull handler (Worker error 1101 / HTTP 500).
+// 60 is the documented floor, so the lock cannot be shorter than this.
+const PULL_LOCK_TTL_SECONDS = 60
 const MAX_CONTEXT_CHARS = 5000
 const MAX_QUEUED_TRANSCRIPTS_PER_TENANT = 100
 
@@ -141,7 +144,7 @@ export async function handleTranscript(request: Request, env: Env): Promise<Resp
   // Per-tenant queue keying. Forks of this template that serve multiple
   // AgentCall agents (one shared signing secret across tenants) get
   // independent FIFOs per agent — a chatty agent can't evict another
-  // agent's transcripts out of the bounded queue. single-agent
+  // agent's transcripts out of the bounded queue. Percy's single-agent
   // deployment lands on 'default' and is functionally identical to the
   // pre-fix global key.
   const tenant = extractTenant(parsed)
@@ -182,7 +185,7 @@ function extractCallId(envelope: unknown): string | null {
  * Extract the tenant key (agentId, falling back to numberId) from an
  * incoming envelope. The bridge accepts the field at either the envelope
  * root or under `data` so it tolerates both shapes AgentCall has used.
- * Returns 'default' when nothing usable is present — single-agent
+ * Returns 'default' when nothing usable is present — Percy's single-agent
  * setup hits this branch and continues to work without code changes.
  */
 function extractTenant(envelope: unknown): string {

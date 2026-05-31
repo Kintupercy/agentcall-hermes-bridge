@@ -16,7 +16,17 @@ function createEnv(): Env {
   const store = new Map<string, string>()
   const kv: KVNamespace = {
     get: async (key: string) => store.get(key) ?? null,
-    put: async (key: string, value: string) => {
+    put: async (key: string, value: string, options?: { expirationTtl?: number }) => {
+      // Mirror real Cloudflare KV: it rejects expirationTtl < 60 with a 400 and
+      // the Worker throws (HTTP 500 / error 1101) if it isn't caught. The old
+      // mock silently ignored the option, so a 30s lock TTL passed every test
+      // but crashed the live pull endpoint. Enforce the floor here.
+      if (options?.expirationTtl !== undefined && options.expirationTtl < 60) {
+        throw new Error(
+          `KV PUT failed: 400 Invalid expiration_ttl of ${options.expirationTtl}. ` +
+            `Expiration TTL must be at least 60.`,
+        )
+      }
       store.set(key, value)
     },
     delete: async (key: string) => {
@@ -576,7 +586,7 @@ describe('handleHermesPullTranscripts', () => {
 
   it('returns 409 when a pull lock is already held (#21 concurrent pull guard)', async () => {
     // Simulate an in-flight pull by manually holding the lock.
-    await env.HERMES_CONTEXT.put('transcript_queue_pull_lock', '1', { expirationTtl: 30 })
+    await env.HERMES_CONTEXT.put('transcript_queue_pull_lock', '1', { expirationTtl: 60 })
     await env.HERMES_CONTEXT.put(
       'transcript_queue:default',
       JSON.stringify([{ callId: 'must_not_drain' }]),
@@ -616,6 +626,26 @@ describe('handleHermesPullTranscripts', () => {
     })
     const res2 = await handleHermesPullTranscripts(req2, env)
     expect(res2.status).toBe(200)
+  })
+
+  it('writes the pull lock with a KV-legal expirationTtl (>= 60s) — regression for error 1101', async () => {
+    // The lock TTL used to be 30s. Cloudflare KV rejects any expirationTtl below
+    // 60s and throws, which crashed every pull with HTTP 500 / error 1101 and
+    // froze post-call transcripts from ever reaching Hermes. The strict mock KV
+    // now throws on a sub-60 TTL, so a successful (non-throwing) pull proves the
+    // lock TTL is legal. Seed a queue so the handler takes the full drain path.
+    await env.HERMES_CONTEXT.put(
+      'transcript_queue:default',
+      JSON.stringify([{ callId: 'must_drain' }]),
+    )
+    const req = new Request('https://hermes.agentcall.co/hermes/pull-transcripts', {
+      method: 'POST',
+      headers: { 'X-Hermes-Push-Key': PUSH_KEY },
+    })
+    const res = await handleHermesPullTranscripts(req, env)
+    expect(res.status).toBe(200)
+    const json = (await res.json()) as { count: number }
+    expect(json.count).toBe(1)
   })
 })
 
