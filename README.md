@@ -11,7 +11,7 @@ Walkthroughs with screenshots and Telegram-prompt examples:
 
 ## What it does
 
-Four endpoints, one always-on Cloudflare KV store:
+Six endpoints, one always-on Cloudflare KV store:
 
 ### Pre-call (brief in)
 - `POST /hermes/push` — your agent platform hits this whenever a new brief is ready. Auth via `X-Hermes-Push-Key` header. Stores the brief in KV (latest wins, 5000-char cap).
@@ -20,6 +20,10 @@ Four endpoints, one always-on Cloudflare KV store:
 ### Post-call (transcript out)
 - `POST /agentcall/transcript` — AgentCall hits this after every inbound AI call ends with the full transcript and an LLM-extracted summary. Verifies an HMAC signature, appends to a bounded FIFO queue in KV (max 100, oldest dropped if your agent stops pulling).
 - `POST /hermes/pull-transcripts` — your agent platform polls this to drain the queue. Same `X-Hermes-Push-Key` header auth. Returns all queued entries and atomically clears them so the next pull is empty until new transcripts arrive.
+
+### Two-way SMS relay (text in, reply out)
+- `POST /agentcall/sms` — with a number in `smsMode: "relay"`, AgentCall hits this on every inbound text. Verifies an HMAC signature (against `AGENTCALL_SMS_SIGNING_SECRET`, falling back to `AGENTCALL_SIGNING_SECRET`), dedups on message id, and appends the relay envelope to a bounded per-agent FIFO queue in KV (max 200). Lets your own agent — not AgentCall's managed AI — answer texts.
+- `POST /hermes/pull-sms` — your agent platform polls this to drain the inbound texts. Same `X-Hermes-Push-Key` auth and atomic clear as the transcript pull. For each entry, reply via AgentCall `POST /v1/sms-conversations/:id/reply` and the reply threads back to the texter.
 
 ### Health
 - `GET /healthz` — liveness probe.
@@ -148,7 +152,7 @@ Node, Go, Rust, `requests`, `httpx`, and curl-based clients send their own User-
 npm test
 ```
 
-32 unit tests cover HMAC verification, all four endpoints, end-to-end push/pull loops for both pre-call and post-call, and failure modes (missing signature, bad key, malformed JSON, queue overflow, oversize body).
+61 unit tests cover HMAC verification, all six endpoints, end-to-end push/pull loops for pre-call, post-call, and SMS relay, and failure modes (missing signature, bad key, malformed JSON, queue overflow, oversize body, dedicated-secret isolation, per-tenant queueing, message-id dedup).
 
 ## License
 

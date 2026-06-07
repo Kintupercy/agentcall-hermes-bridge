@@ -5,6 +5,8 @@ import worker, {
   handleHermesPush,
   handleTranscript,
   handleHermesPullTranscripts,
+  handleAgentcallSms,
+  handleHermesPullSms,
   timingSafeEqualString,
   type Env,
 } from './index'
@@ -748,5 +750,265 @@ describe('worker.fetch (routing)', () => {
     expect(res.status).toBe(200)
     const json = (await res.json()) as { contextBlock: string }
     expect(json.contextBlock).toBe('Brief from Hermes for the call.')
+  })
+})
+
+function relayPayload(
+  messageId: string,
+  opts: { agentId?: string; numberId?: string; body?: string } = {},
+): string {
+  return JSON.stringify({
+    message: {
+      id: messageId,
+      from: '+13146006254',
+      to: '+13146970472',
+      body: opts.body ?? 'hey laura',
+      receivedAt: '2026-06-07T16:00:00Z',
+    },
+    conversation: { id: `smsconv_${messageId}`, contactPhone: '+13146006254' },
+    context: {
+      channel: 'sms',
+      numberId: opts.numberId ?? 'num_laura',
+      ...(opts.agentId ? { agentId: opts.agentId } : {}),
+    },
+  })
+}
+
+describe('handleAgentcallSms', () => {
+  let env: Env
+
+  beforeEach(() => {
+    env = createEnv()
+  })
+
+  it('queues under the tenant from context.agentId', async () => {
+    const body = relayPayload('msg_1', { agentId: 'agent_abc' })
+    const sig = await hmac(body, SIGNING_SECRET)
+    const req = new Request('https://hermes.agentcall.co/agentcall/sms', {
+      method: 'POST',
+      headers: { 'X-AgentCall-Signature': sig, 'Content-Type': 'application/json' },
+      body,
+    })
+    const res = await handleAgentcallSms(req, env)
+    expect(res.status).toBe(200)
+    const json = (await res.json()) as { status: string; queueDepth: number; tenant: string }
+    expect(json.status).toBe('queued')
+    expect(json.queueDepth).toBe(1)
+    expect(json.tenant).toBe('agent_abc')
+    expect(await env.HERMES_CONTEXT.get('sms_queue:agent_abc')).not.toBeNull()
+  })
+
+  it('falls back to numberId then default when agentId is absent', async () => {
+    const byNumber = relayPayload('msg_n', {})
+    const sig = await hmac(byNumber, SIGNING_SECRET)
+    const req = new Request('https://hermes.agentcall.co/agentcall/sms', {
+      method: 'POST',
+      headers: { 'X-AgentCall-Signature': sig },
+      body: byNumber,
+    })
+    const res = await handleAgentcallSms(req, env)
+    const json = (await res.json()) as { tenant: string }
+    expect(json.tenant).toBe('num_laura')
+  })
+
+  it('dedups on message.id (retry storm does not double-queue)', async () => {
+    const body = relayPayload('msg_dup', { agentId: 'a1' })
+    const sig = await hmac(body, SIGNING_SECRET)
+    const mk = () =>
+      new Request('https://hermes.agentcall.co/agentcall/sms', {
+        method: 'POST',
+        headers: { 'X-AgentCall-Signature': sig },
+        body,
+      })
+    const first = (await (await handleAgentcallSms(mk(), env)).json()) as { status: string }
+    const second = (await (await handleAgentcallSms(mk(), env)).json()) as {
+      status: string
+      queueDepth: number
+    }
+    expect(first.status).toBe('queued')
+    expect(second.status).toBe('duplicate')
+    expect(second.queueDepth).toBe(1)
+  })
+
+  it('appends in FIFO order', async () => {
+    for (const id of ['a', 'b', 'c']) {
+      const body = relayPayload(id, { agentId: 'a1' })
+      const sig = await hmac(body, SIGNING_SECRET)
+      const req = new Request('https://hermes.agentcall.co/agentcall/sms', {
+        method: 'POST',
+        headers: { 'X-AgentCall-Signature': sig },
+        body,
+      })
+      expect((await handleAgentcallSms(req, env)).status).toBe(200)
+    }
+    const stored = await env.HERMES_CONTEXT.get('sms_queue:a1')
+    const queue = JSON.parse(stored!) as Array<{ message: { id: string } }>
+    expect(queue.map((m) => m.message.id)).toEqual(['a', 'b', 'c'])
+  })
+
+  it('rejects an invalid HMAC signature and stores nothing', async () => {
+    const req = new Request('https://hermes.agentcall.co/agentcall/sms', {
+      method: 'POST',
+      headers: { 'X-AgentCall-Signature': 'sha256=0000' },
+      body: relayPayload('msg_x', { agentId: 'a1' }),
+    })
+    const res = await handleAgentcallSms(req, env)
+    expect(res.status).toBe(401)
+    expect(await env.HERMES_CONTEXT.get('sms_queue:a1')).toBeNull()
+  })
+
+  it('rejects invalid JSON even with a valid HMAC', async () => {
+    const body = 'not json'
+    const sig = await hmac(body, SIGNING_SECRET)
+    const req = new Request('https://hermes.agentcall.co/agentcall/sms', {
+      method: 'POST',
+      headers: { 'X-AgentCall-Signature': sig },
+      body,
+    })
+    expect((await handleAgentcallSms(req, env)).status).toBe(400)
+  })
+
+  it('caps the queue at 200 entries per tenant and drops oldest', async () => {
+    const existing = Array.from({ length: 200 }, (_, i) => ({ message: { id: `old_${i}` } }))
+    await env.HERMES_CONTEXT.put('sms_queue:a1', JSON.stringify(existing))
+    const body = relayPayload('newest', { agentId: 'a1' })
+    const sig = await hmac(body, SIGNING_SECRET)
+    const req = new Request('https://hermes.agentcall.co/agentcall/sms', {
+      method: 'POST',
+      headers: { 'X-AgentCall-Signature': sig },
+      body,
+    })
+    expect((await handleAgentcallSms(req, env)).status).toBe(200)
+    const stored = await env.HERMES_CONTEXT.get('sms_queue:a1')
+    const queue = JSON.parse(stored!) as Array<{ message: { id: string } }>
+    expect(queue.length).toBe(200)
+    expect(queue[0].message.id).toBe('old_1')
+    expect(queue[199].message.id).toBe('newest')
+  })
+
+  it('uses the dedicated SMS signing secret when set (channels isolated)', async () => {
+    const smsSecret = 'sms_only_secret_for_relay_unit_test'
+    env.AGENTCALL_SMS_SIGNING_SECRET = smsSecret
+    // Signed with the dedicated SMS secret -> accepted.
+    const good = relayPayload('msg_sep', { agentId: 'a1' })
+    const goodReq = new Request('https://hermes.agentcall.co/agentcall/sms', {
+      method: 'POST',
+      headers: { 'X-AgentCall-Signature': await hmac(good, smsSecret) },
+      body: good,
+    })
+    expect((await handleAgentcallSms(goodReq, env)).status).toBe(200)
+    // Signed with the shared precall/transcript secret -> rejected once the
+    // dedicated secret is set.
+    const bad = relayPayload('msg_sep2', { agentId: 'a1' })
+    const badReq = new Request('https://hermes.agentcall.co/agentcall/sms', {
+      method: 'POST',
+      headers: { 'X-AgentCall-Signature': await hmac(bad, SIGNING_SECRET) },
+      body: bad,
+    })
+    expect((await handleAgentcallSms(badReq, env)).status).toBe(401)
+  })
+})
+
+describe('handleHermesPullSms', () => {
+  let env: Env
+
+  beforeEach(() => {
+    env = createEnv()
+  })
+
+  it('rejects a missing/invalid push key', async () => {
+    const req = new Request('https://hermes.agentcall.co/hermes/pull-sms', {
+      method: 'POST',
+      headers: { 'X-Hermes-Push-Key': 'wrong' },
+    })
+    expect((await handleHermesPullSms(req, env)).status).toBe(401)
+  })
+
+  it('drains all per-tenant queues and clears them', async () => {
+    await env.HERMES_CONTEXT.put('sms_queue:a1', JSON.stringify([{ message: { id: 'm1' } }]))
+    await env.HERMES_CONTEXT.put('sms_queue:a2', JSON.stringify([{ message: { id: 'm2' } }]))
+    const req = new Request('https://hermes.agentcall.co/hermes/pull-sms', {
+      method: 'POST',
+      headers: { 'X-Hermes-Push-Key': PUSH_KEY },
+    })
+    const res = await handleHermesPullSms(req, env)
+    expect(res.status).toBe(200)
+    const json = (await res.json()) as { messages: unknown[]; count: number; tenantsDrained: string[] }
+    expect(json.count).toBe(2)
+    expect(json.tenantsDrained.sort()).toEqual(['a1', 'a2'])
+    expect(JSON.parse((await env.HERMES_CONTEXT.get('sms_queue:a1'))!)).toEqual([])
+  })
+
+  it('does not drain the transcript queues (prefix isolation)', async () => {
+    await env.HERMES_CONTEXT.put('transcript_queue:default', JSON.stringify([{ callId: 'c1' }]))
+    await env.HERMES_CONTEXT.put('sms_queue:a1', JSON.stringify([{ message: { id: 'm1' } }]))
+    const req = new Request('https://hermes.agentcall.co/hermes/pull-sms', {
+      method: 'POST',
+      headers: { 'X-Hermes-Push-Key': PUSH_KEY },
+    })
+    const res = await handleHermesPullSms(req, env)
+    const json = (await res.json()) as { count: number }
+    expect(json.count).toBe(1)
+    // transcript queue untouched
+    expect(JSON.parse((await env.HERMES_CONTEXT.get('transcript_queue:default'))!)).toHaveLength(1)
+  })
+})
+
+describe('worker.fetch (SMS relay routing + e2e)', () => {
+  let env: Env
+
+  beforeEach(() => {
+    env = createEnv()
+  })
+
+  it('routes POST /agentcall/sms to handleAgentcallSms', async () => {
+    const body = relayPayload('route_1', { agentId: 'a1' })
+    const sig = await hmac(body, SIGNING_SECRET)
+    const req = new Request('https://hermes.agentcall.co/agentcall/sms', {
+      method: 'POST',
+      headers: { 'X-AgentCall-Signature': sig },
+      body,
+    })
+    expect((await worker.fetch(req, env)).status).toBe(200)
+  })
+
+  it('routes POST /hermes/pull-sms to handleHermesPullSms', async () => {
+    const req = new Request('https://hermes.agentcall.co/hermes/pull-sms', {
+      method: 'POST',
+      headers: { 'X-Hermes-Push-Key': PUSH_KEY },
+    })
+    expect((await worker.fetch(req, env)).status).toBe(200)
+  })
+
+  it('end-to-end relay: AgentCall pushes text → Laura pulls → queue empty', async () => {
+    const body = relayPayload('e2e_sms', { agentId: 'a1', body: 'what is on my plate today?' })
+    const sig = await hmac(body, SIGNING_SECRET)
+    const pushReq = new Request('https://hermes.agentcall.co/agentcall/sms', {
+      method: 'POST',
+      headers: { 'X-AgentCall-Signature': sig },
+      body,
+    })
+    expect((await worker.fetch(pushReq, env)).status).toBe(200)
+
+    const pullReq = new Request('https://hermes.agentcall.co/hermes/pull-sms', {
+      method: 'POST',
+      headers: { 'X-Hermes-Push-Key': PUSH_KEY },
+    })
+    const pullRes = await worker.fetch(pullReq, env)
+    expect(pullRes.status).toBe(200)
+    const json = (await pullRes.json()) as {
+      messages: Array<{ message: { id: string }; conversation: { id: string } }>
+      count: number
+    }
+    expect(json.count).toBe(1)
+    expect(json.messages[0].message.id).toBe('e2e_sms')
+    expect(json.messages[0].conversation.id).toBe('smsconv_e2e_sms')
+
+    const pullAgain = new Request('https://hermes.agentcall.co/hermes/pull-sms', {
+      method: 'POST',
+      headers: { 'X-Hermes-Push-Key': PUSH_KEY },
+    })
+    const empty = await worker.fetch(pullAgain, env)
+    expect(((await empty.json()) as { count: number }).count).toBe(0)
   })
 })
