@@ -85,7 +85,10 @@ const MAX_QUEUED_SMS_PER_TENANT = 200
 // the agent's worst-case think+reply time (the brain step). Dropped-text bugs
 // in a customer-facing SMS agent are unacceptable, so we favor redelivery
 // (duplicates are harmless: replies are idempotent on the message id).
-const SMS_VISIBILITY_MS = 120000
+// Measured: a memory-aware Hermes reply can take ~150s, so this must sit well
+// above that or a slow brain gets the text redelivered and runs twice. 300s
+// gives generous headroom; redelivery only kicks in on a genuine stall/crash.
+const SMS_VISIBILITY_MS = 300000
 
 /**
  * Constant-time string comparison. Returns true iff a === b after comparing
