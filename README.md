@@ -11,7 +11,7 @@ Walkthroughs with screenshots and Telegram-prompt examples:
 
 ## What it does
 
-Six endpoints, one always-on Cloudflare KV store:
+Seven endpoints, one always-on Cloudflare KV store:
 
 ### Pre-call (brief in)
 - `POST /hermes/push` — your agent platform hits this whenever a new brief is ready. Auth via `X-Hermes-Push-Key` header. Stores the brief in KV (latest wins, 5000-char cap).
@@ -23,7 +23,8 @@ Six endpoints, one always-on Cloudflare KV store:
 
 ### Two-way SMS relay (text in, reply out)
 - `POST /agentcall/sms` — with a number in `smsMode: "relay"`, AgentCall hits this on every inbound text. Verifies an HMAC signature (against `AGENTCALL_SMS_SIGNING_SECRET`, falling back to `AGENTCALL_SIGNING_SECRET`), dedups on message id, and appends the relay envelope to a bounded per-agent FIFO queue in KV (max 200). Lets your own agent — not AgentCall's managed AI — answer texts.
-- `POST /hermes/pull-sms` — your agent platform polls this to drain the inbound texts. Same `X-Hermes-Push-Key` auth and atomic clear as the transcript pull. For each entry, reply via AgentCall `POST /v1/sms-conversations/:id/reply` and the reply threads back to the texter.
+- `POST /hermes/pull-sms` — your agent platform polls this to **claim** inbound texts (at-least-once delivery). Same `X-Hermes-Push-Key` auth. Unlike the transcript pull, it does **not** delete on read: each returned text is hidden for a visibility window (default 120s) instead, so a canceled pull or a crashed/restarted consumer never loses a text. For each entry, reply via AgentCall `POST /v1/sms-conversations/:id/reply`, then ack it.
+- `POST /hermes/ack-sms` — after you've replied to (or decided to drop) a text, ack it so it's removed for good. Body `{ "messageIds": ["..."] }`. Idempotent. If you never ack (crash/error), the claim expires and the text is redelivered on the next pull. Replies are idempotent on the message id, so redelivery can't double-text.
 
 ### Health
 - `GET /healthz` — liveness probe.
@@ -152,7 +153,7 @@ Node, Go, Rust, `requests`, `httpx`, and curl-based clients send their own User-
 npm test
 ```
 
-61 unit tests cover HMAC verification, all six endpoints, end-to-end push/pull loops for pre-call, post-call, and SMS relay, and failure modes (missing signature, bad key, malformed JSON, queue overflow, oversize body, dedicated-secret isolation, per-tenant queueing, message-id dedup).
+69 unit tests cover HMAC verification, all seven endpoints, end-to-end push/pull loops for pre-call, post-call, and SMS relay (push → claim → ack), and failure modes (missing signature, bad key, malformed JSON, queue overflow, oversize body, dedicated-secret isolation, per-tenant queueing, message-id dedup, claim visibility + redelivery after expiry, idempotent ack).
 
 ## License
 
