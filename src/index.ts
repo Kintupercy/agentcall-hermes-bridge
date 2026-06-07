@@ -25,6 +25,22 @@
  *                                 concurrent pulls can't both clear the queue
  *                                 and drop in-flight transcripts. Protected by
  *                                 X-Hermes-Push-Key header (constant-time).
+ *  - POST /agentcall/sms          AgentCall calls this (relay / smsMode:'relay')
+ *                                 on every inbound text to a relay-enabled
+ *                                 number. Verifies HMAC, appends the relay
+ *                                 envelope to a bounded per-agent SMS queue in
+ *                                 KV. Mirrors /agentcall/transcript: AgentCall
+ *                                 pushes, Hermes/Laura pulls and replies via
+ *                                 AgentCall POST /v1/sms-conversations/:id/reply.
+ *  - POST /hermes/pull-sms        Hermes/Laura polls this to CLAIM queued
+ *                                 inbound relay texts (at-least-once): returned
+ *                                 texts are hidden for SMS_VISIBILITY_MS, not
+ *                                 deleted, so a canceled pull or crashed
+ *                                 consumer never loses one. Soft-lock +
+ *                                 X-Hermes-Push-Key protection.
+ *  - POST /hermes/ack-sms         Consumer acks processed texts ({messageIds})
+ *                                 so they're removed for good. The other half
+ *                                 of at-least-once delivery. Idempotent.
  *  - GET  /healthz                Liveness probe.
  *
  * Known gaps tracked for follow-up PRs:
@@ -37,19 +53,42 @@
 export interface Env {
   HERMES_CONTEXT: KVNamespace
   AGENTCALL_SIGNING_SECRET: string
+  // Optional dedicated secret for the SMS relay webhook (/agentcall/sms). Lets
+  // the relay use a different shared secret than precall/transcript so rotating
+  // or compromising one channel never affects the other. Falls back to
+  // AGENTCALL_SIGNING_SECRET when unset, so existing single-secret deployments
+  // keep working unchanged.
+  AGENTCALL_SMS_SIGNING_SECRET?: string
   HERMES_PUSH_KEY: string
 }
 
 const KV_KEY = 'current'
 const TRANSCRIPT_QUEUE_PREFIX = 'transcript_queue:'
+const SMS_QUEUE_PREFIX = 'sms_queue:'
 const DEFAULT_TENANT = 'default'
 const PULL_LOCK_KEY = 'transcript_queue_pull_lock'
+const SMS_PULL_LOCK_KEY = 'sms_queue_pull_lock'
 // Cloudflare KV rejects any `expirationTtl` below 60 seconds and throws,
 // which would crash the whole pull handler (Worker error 1101 / HTTP 500).
 // 60 is the documented floor, so the lock cannot be shorter than this.
 const PULL_LOCK_TTL_SECONDS = 60
 const MAX_CONTEXT_CHARS = 5000
 const MAX_QUEUED_TRANSCRIPTS_PER_TENANT = 100
+// Inbound texts are tiny vs transcripts, and a burst of texts during a Laura
+// outage shouldn't evict as readily, so allow a deeper FIFO. Still well under
+// the 25MB KV value cap.
+const MAX_QUEUED_SMS_PER_TENANT = 200
+// At-least-once delivery: a pulled text is *claimed* (hidden) for this long
+// rather than deleted. Only an explicit /hermes/ack-sms removes it. If the
+// consumer crashes or a pull is canceled mid-flight, the claim expires and the
+// text is redelivered instead of being silently lost. Must comfortably exceed
+// the agent's worst-case think+reply time (the brain step). Dropped-text bugs
+// in a customer-facing SMS agent are unacceptable, so we favor redelivery
+// (duplicates are harmless: replies are idempotent on the message id).
+// Measured: a memory-aware Hermes reply can take ~150s, so this must sit well
+// above that or a slow brain gets the text redelivered and runs twice. 300s
+// gives generous headroom; redelivery only kicks in on a genuine stall/crash.
+const SMS_VISIBILITY_MS = 300000
 
 /**
  * Constant-time string comparison. Returns true iff a === b after comparing
@@ -273,6 +312,190 @@ export async function handleHermesPullTranscripts(request: Request, env: Env): P
   }
 }
 
+/**
+ * AgentCall relay push. Fired on every inbound text to a relay-enabled number
+ * (smsMode:'relay'). The relay worker retries non-2xx up to 5 times, so this
+ * dedups on the AgentCall message id and acks fast — it does NOT think or
+ * reply. Laura's brain pulls via /hermes/pull-sms and replies through
+ * AgentCall's POST /v1/sms-conversations/:id/reply, keeping the whole thread
+ * (and STOP handling) inside AgentCall. Mirrors handleTranscript.
+ *
+ * Relay envelope shape (AgentCall sms.relay webhook):
+ *   { message: {id,from,to,body,receivedAt},
+ *     conversation: {id,contactPhone},
+ *     context: {channel:'sms',numberId,agentId} }
+ */
+export async function handleAgentcallSms(request: Request, env: Env): Promise<Response> {
+  const body = await request.text()
+  const signature = request.headers.get('X-AgentCall-Signature')
+  const smsSecret = env.AGENTCALL_SMS_SIGNING_SECRET || env.AGENTCALL_SIGNING_SECRET
+  const valid = await verifyHmacSignature(body, signature, smsSecret)
+  if (!valid) {
+    return jsonResponse({ error: 'invalid_signature' }, 401)
+  }
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(body)
+  } catch {
+    return jsonResponse({ error: 'invalid_json' }, 400)
+  }
+
+  const tenant = extractSmsTenant(parsed)
+  const queueKey = `${SMS_QUEUE_PREFIX}${tenant}`
+
+  const stored = await env.HERMES_CONTEXT.get(queueKey)
+  const queue: unknown[] = stored ? safeParseArray(stored) : []
+  // Dedup on the AgentCall message id so retry storms don't double-queue (and
+  // Laura doesn't double-reply). 200 + status:'duplicate' stops the retry.
+  const incomingId = extractMessageId(parsed)
+  if (incomingId && queue.some((item) => extractMessageId(item) === incomingId)) {
+    return jsonResponse({ status: 'duplicate', messageId: incomingId, queueDepth: queue.length, tenant })
+  }
+  queue.push(parsed)
+  if (queue.length > MAX_QUEUED_SMS_PER_TENANT) {
+    queue.splice(0, queue.length - MAX_QUEUED_SMS_PER_TENANT)
+  }
+  await env.HERMES_CONTEXT.put(queueKey, JSON.stringify(queue))
+  return jsonResponse({ status: 'queued', queueDepth: queue.length, tenant })
+}
+
+/** Relay message id lives at `message.id`; tolerate a root `id` fallback. */
+function extractMessageId(envelope: unknown): string | null {
+  if (!envelope || typeof envelope !== 'object') return null
+  const e = envelope as { message?: { id?: unknown }; id?: unknown }
+  if (e.message && typeof e.message === 'object' && typeof e.message.id === 'string') {
+    return e.message.id
+  }
+  if (typeof e.id === 'string') return e.id
+  return null
+}
+
+/**
+ * Relay puts agentId/numberId under `context` (not root/`data` like the
+ * transcript webhook), so read there first, then fall back to the generic
+ * extractor. Percy's single-agent setup lands on its agentId; anything
+ * unrecognized lands on 'default' and still works.
+ */
+function extractSmsTenant(envelope: unknown): string {
+  if (!envelope || typeof envelope !== 'object') return DEFAULT_TENANT
+  const e = envelope as { context?: { agentId?: unknown; numberId?: unknown } }
+  const candidates = [e.context?.agentId, e.context?.numberId]
+  for (const c of candidates) {
+    if (typeof c === 'string' && c.length > 0 && c.length <= 100) {
+      return sanitizeTenantKey(c)
+    }
+  }
+  return extractTenant(envelope)
+}
+
+/**
+ * Claim queued inbound relay texts across all per-agent queues (at-least-once
+ * delivery). Unlike the transcript pull, this does NOT delete on read: each
+ * returned text is stamped with a claim time and hidden for SMS_VISIBILITY_MS.
+ * Only /hermes/ack-sms removes it. So a canceled pull or a crashed/restarted
+ * consumer never loses a text — the claim expires and it's redelivered. The
+ * `_claimedAt` bookkeeping field is stripped before returning. push-key auth +
+ * the dedicated soft-lock so two concurrent pulls can't double-claim. Reply to
+ * each via AgentCall POST /v1/sms-conversations/:id/reply, then ack its id.
+ */
+export async function handleHermesPullSms(request: Request, env: Env): Promise<Response> {
+  const key = request.headers.get('X-Hermes-Push-Key')
+  if (!key || !timingSafeEqualString(key, env.HERMES_PUSH_KEY)) {
+    return jsonResponse({ error: 'unauthorized' }, 401)
+  }
+
+  const existingLock = await env.HERMES_CONTEXT.get(SMS_PULL_LOCK_KEY)
+  if (existingLock) {
+    return jsonResponse({ error: 'pull_in_progress', retryAfterSeconds: PULL_LOCK_TTL_SECONDS }, 409)
+  }
+  await env.HERMES_CONTEXT.put(SMS_PULL_LOCK_KEY, '1', { expirationTtl: PULL_LOCK_TTL_SECONDS })
+
+  try {
+    const now = Date.now()
+    const list = await env.HERMES_CONTEXT.list({ prefix: SMS_QUEUE_PREFIX })
+    const allMessages: unknown[] = []
+    const tenantsDelivered: string[] = []
+
+    for (const entry of list.keys) {
+      const stored = await env.HERMES_CONTEXT.get(entry.name)
+      if (!stored) continue
+      const queue = safeParseArray(stored) as Array<Record<string, unknown>>
+      if (queue.length === 0) continue
+
+      let changed = false
+      const delivered: unknown[] = []
+      for (const item of queue) {
+        const claimedAt = typeof item._claimedAt === 'number' ? item._claimedAt : null
+        const visible = claimedAt === null || now - claimedAt > SMS_VISIBILITY_MS
+        if (!visible) continue
+        item._claimedAt = now // claim (hide) without deleting
+        changed = true
+        const { _claimedAt, ...clean } = item // strip bookkeeping before return
+        void _claimedAt
+        delivered.push(clean)
+      }
+
+      if (delivered.length > 0) {
+        allMessages.push(...delivered)
+        tenantsDelivered.push(entry.name.slice(SMS_QUEUE_PREFIX.length))
+      }
+      if (changed) await env.HERMES_CONTEXT.put(entry.name, JSON.stringify(queue))
+    }
+
+    return jsonResponse({ messages: allMessages, count: allMessages.length, tenantsDelivered })
+  } finally {
+    await env.HERMES_CONTEXT.delete(SMS_PULL_LOCK_KEY).catch(() => {
+      // Best-effort; the lock's expirationTtl releases it even if delete fails.
+    })
+  }
+}
+
+/**
+ * Acknowledge processed relay texts so they're removed for good. The consumer
+ * calls this AFTER it has successfully replied (or decided to drop) each text.
+ * Body: { messageIds: string[] }. Idempotent — acking an unknown/already-removed
+ * id is a no-op. This is the other half of at-least-once delivery: claim on
+ * pull, remove on ack. push-key auth.
+ */
+export async function handleHermesAckSms(request: Request, env: Env): Promise<Response> {
+  const key = request.headers.get('X-Hermes-Push-Key')
+  if (!key || !timingSafeEqualString(key, env.HERMES_PUSH_KEY)) {
+    return jsonResponse({ error: 'unauthorized' }, 401)
+  }
+  let parsed: unknown
+  try {
+    parsed = await request.json()
+  } catch {
+    return jsonResponse({ error: 'invalid_json' }, 400)
+  }
+  const rawIds = (parsed as { messageIds?: unknown })?.messageIds
+  const ids = Array.isArray(rawIds) ? rawIds.filter((x): x is string => typeof x === 'string') : []
+  if (ids.length === 0) {
+    return jsonResponse({ error: 'messageIds_required' }, 400)
+  }
+  const idSet = new Set(ids)
+
+  const list = await env.HERMES_CONTEXT.list({ prefix: SMS_QUEUE_PREFIX })
+  let removed = 0
+  for (const entry of list.keys) {
+    const stored = await env.HERMES_CONTEXT.get(entry.name)
+    if (!stored) continue
+    const queue = safeParseArray(stored)
+    const kept = queue.filter((item) => {
+      const id = extractMessageId(item)
+      if (id && idSet.has(id)) {
+        removed++
+        return false
+      }
+      return true
+    })
+    if (kept.length !== queue.length) {
+      await env.HERMES_CONTEXT.put(entry.name, JSON.stringify(kept))
+    }
+  }
+  return jsonResponse({ status: 'ok', removed })
+}
+
 function safeParseArray(raw: string): unknown[] {
   try {
     const parsed = JSON.parse(raw)
@@ -307,6 +530,15 @@ export default {
     }
     if (url.pathname === '/hermes/pull-transcripts' && request.method === 'POST') {
       return handleHermesPullTranscripts(request, env)
+    }
+    if (url.pathname === '/agentcall/sms' && request.method === 'POST') {
+      return handleAgentcallSms(request, env)
+    }
+    if (url.pathname === '/hermes/pull-sms' && request.method === 'POST') {
+      return handleHermesPullSms(request, env)
+    }
+    if (url.pathname === '/hermes/ack-sms' && request.method === 'POST') {
+      return handleHermesAckSms(request, env)
     }
     return new Response('Not found', { status: 404 })
   },
