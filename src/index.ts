@@ -36,8 +36,9 @@
  *                                 inbound relay texts (at-least-once): returned
  *                                 texts are hidden for SMS_VISIBILITY_MS, not
  *                                 deleted, so a canceled pull or crashed
- *                                 consumer never loses one. Soft-lock +
- *                                 X-Hermes-Push-Key protection.
+ *                                 consumer never loses one. No soft-lock (claim
+ *                                 is idempotent; the lock's 60s TTL caused stalls).
+ *                                 X-Hermes-Push-Key protected.
  *  - POST /hermes/ack-sms         Consumer acks processed texts ({messageIds})
  *                                 so they're removed for good. The other half
  *                                 of at-least-once delivery. Idempotent.
@@ -67,7 +68,6 @@ const TRANSCRIPT_QUEUE_PREFIX = 'transcript_queue:'
 const SMS_QUEUE_PREFIX = 'sms_queue:'
 const DEFAULT_TENANT = 'default'
 const PULL_LOCK_KEY = 'transcript_queue_pull_lock'
-const SMS_PULL_LOCK_KEY = 'sms_queue_pull_lock'
 // Cloudflare KV rejects any `expirationTtl` below 60 seconds and throws,
 // which would crash the whole pull handler (Worker error 1101 / HTTP 500).
 // 60 is the documented floor, so the lock cannot be shorter than this.
@@ -394,9 +394,16 @@ function extractSmsTenant(envelope: unknown): string {
  * returned text is stamped with a claim time and hidden for SMS_VISIBILITY_MS.
  * Only /hermes/ack-sms removes it. So a canceled pull or a crashed/restarted
  * consumer never loses a text — the claim expires and it's redelivered. The
- * `_claimedAt` bookkeeping field is stripped before returning. push-key auth +
- * the dedicated soft-lock so two concurrent pulls can't double-claim. Reply to
- * each via AgentCall POST /v1/sms-conversations/:id/reply, then ack its id.
+ * `_claimedAt` bookkeeping field is stripped before returning.
+ *
+ * NO soft-lock here (unlike the transcript pull). The claim model already makes
+ * a double-pull harmless (both would re-claim the same already-claimed items,
+ * and replies are idempotent on the message id), and the consumer is single.
+ * The lock's 60s KV-TTL floor was actively harmful: if a pull was canceled
+ * before releasing it, EVERY pull 409'd for up to 60s and the text sat
+ * unprocessed — the exact ~55s SMS stall we measured. Dropping it makes pickup
+ * bounded by the consumer's poll interval (~2s) instead of the lock TTL.
+ * Reply to each via AgentCall POST /v1/sms-conversations/:id/reply, then ack.
  */
 export async function handleHermesPullSms(request: Request, env: Env): Promise<Response> {
   const key = request.headers.get('X-Hermes-Push-Key')
@@ -404,50 +411,38 @@ export async function handleHermesPullSms(request: Request, env: Env): Promise<R
     return jsonResponse({ error: 'unauthorized' }, 401)
   }
 
-  const existingLock = await env.HERMES_CONTEXT.get(SMS_PULL_LOCK_KEY)
-  if (existingLock) {
-    return jsonResponse({ error: 'pull_in_progress', retryAfterSeconds: PULL_LOCK_TTL_SECONDS }, 409)
-  }
-  await env.HERMES_CONTEXT.put(SMS_PULL_LOCK_KEY, '1', { expirationTtl: PULL_LOCK_TTL_SECONDS })
+  const now = Date.now()
+  const list = await env.HERMES_CONTEXT.list({ prefix: SMS_QUEUE_PREFIX })
+  const allMessages: unknown[] = []
+  const tenantsDelivered: string[] = []
 
-  try {
-    const now = Date.now()
-    const list = await env.HERMES_CONTEXT.list({ prefix: SMS_QUEUE_PREFIX })
-    const allMessages: unknown[] = []
-    const tenantsDelivered: string[] = []
+  for (const entry of list.keys) {
+    const stored = await env.HERMES_CONTEXT.get(entry.name)
+    if (!stored) continue
+    const queue = safeParseArray(stored) as Array<Record<string, unknown>>
+    if (queue.length === 0) continue
 
-    for (const entry of list.keys) {
-      const stored = await env.HERMES_CONTEXT.get(entry.name)
-      if (!stored) continue
-      const queue = safeParseArray(stored) as Array<Record<string, unknown>>
-      if (queue.length === 0) continue
-
-      let changed = false
-      const delivered: unknown[] = []
-      for (const item of queue) {
-        const claimedAt = typeof item._claimedAt === 'number' ? item._claimedAt : null
-        const visible = claimedAt === null || now - claimedAt > SMS_VISIBILITY_MS
-        if (!visible) continue
-        item._claimedAt = now // claim (hide) without deleting
-        changed = true
-        const { _claimedAt, ...clean } = item // strip bookkeeping before return
-        void _claimedAt
-        delivered.push(clean)
-      }
-
-      if (delivered.length > 0) {
-        allMessages.push(...delivered)
-        tenantsDelivered.push(entry.name.slice(SMS_QUEUE_PREFIX.length))
-      }
-      if (changed) await env.HERMES_CONTEXT.put(entry.name, JSON.stringify(queue))
+    let changed = false
+    const delivered: unknown[] = []
+    for (const item of queue) {
+      const claimedAt = typeof item._claimedAt === 'number' ? item._claimedAt : null
+      const visible = claimedAt === null || now - claimedAt > SMS_VISIBILITY_MS
+      if (!visible) continue
+      item._claimedAt = now // claim (hide) without deleting
+      changed = true
+      const { _claimedAt, ...clean } = item // strip bookkeeping before return
+      void _claimedAt
+      delivered.push(clean)
     }
 
-    return jsonResponse({ messages: allMessages, count: allMessages.length, tenantsDelivered })
-  } finally {
-    await env.HERMES_CONTEXT.delete(SMS_PULL_LOCK_KEY).catch(() => {
-      // Best-effort; the lock's expirationTtl releases it even if delete fails.
-    })
+    if (delivered.length > 0) {
+      allMessages.push(...delivered)
+      tenantsDelivered.push(entry.name.slice(SMS_QUEUE_PREFIX.length))
+    }
+    if (changed) await env.HERMES_CONTEXT.put(entry.name, JSON.stringify(queue))
   }
+
+  return jsonResponse({ messages: allMessages, count: allMessages.length, tenantsDelivered })
 }
 
 /**
