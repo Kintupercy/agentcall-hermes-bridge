@@ -11,7 +11,7 @@ Walkthroughs with screenshots and Telegram-prompt examples:
 
 ## What it does
 
-Seven endpoints, one always-on Cloudflare KV store:
+Ten endpoints, one always-on Cloudflare KV store:
 
 ### Pre-call (brief in)
 - `POST /hermes/push` — your agent platform hits this whenever a new brief is ready. Auth via `X-Hermes-Push-Key` header. Stores the brief in KV (latest wins, 5000-char cap).
@@ -25,6 +25,11 @@ Seven endpoints, one always-on Cloudflare KV store:
 - `POST /agentcall/sms` — with a number in `smsMode: "relay"`, AgentCall hits this on every inbound text. Verifies an HMAC signature (against `AGENTCALL_SMS_SIGNING_SECRET`, falling back to `AGENTCALL_SIGNING_SECRET`), dedups on message id, and appends the relay envelope to a bounded per-agent FIFO queue in KV (max 200). Lets your own agent — not AgentCall's managed AI — answer texts.
 - `POST /hermes/pull-sms` — your agent platform polls this to **claim** inbound texts (at-least-once delivery). Same `X-Hermes-Push-Key` auth. Unlike the transcript pull, it does **not** delete on read: each returned text is hidden for a visibility window (default 120s) instead, so a canceled pull or a crashed/restarted consumer never loses a text. For each entry, reply via AgentCall `POST /v1/sms-conversations/:id/reply`, then ack it.
 - `POST /hermes/ack-sms` — after you've replied to (or decided to drop) a text, ack it so it's removed for good. Body `{ "messageIds": ["..."] }`. Idempotent. If you never ack (crash/error), the claim expires and the text is redelivered on the next pull. Replies are idempotent on the message id, so redelivery can't double-text.
+
+### Action bridge (the agent's hands)
+- `POST /agentcall/action` — with tools + an `actionWebhook` declared on a number, AgentCall hits this when the AI agent invokes a tool mid-conversation (SMS or voice). Verifies an HMAC signature (against `AGENTCALL_ACTION_SIGNING_SECRET`, falling back to `AGENTCALL_SIGNING_SECRET`) and dispatches synchronously — the response `{"result": "..."}` is fed straight back to the LLM, so everything here must answer inside the tool timeout (max 8s). Two KV-backed tools ship with the template: `get_latest_brief` (returns the same brief `/agentcall/precall` serves, letting the agent refresh context mid-thread) and `save_note` (appends the note to a bounded per-agent FIFO queue, max 200, for your platform to pull). Unknown tools return an explanatory result string the LLM can relay instead of a bare error.
+- `POST /hermes/pull-notes` — your agent platform polls this to read saved notes. Same `X-Hermes-Push-Key` auth. Does **not** delete on read: notes are returned on every poll until acked, so a crashed consumer never loses one. Dedup on note `id` if you see repeats.
+- `POST /hermes/ack-notes` — after processing, ack with `{ "noteIds": ["..."] }` to remove notes for good. Idempotent.
 
 ### Health
 - `GET /healthz` — liveness probe.
@@ -153,7 +158,7 @@ Node, Go, Rust, `requests`, `httpx`, and curl-based clients send their own User-
 npm test
 ```
 
-69 unit tests cover HMAC verification, all seven endpoints, end-to-end push/pull loops for pre-call, post-call, and SMS relay (push → claim → ack), and failure modes (missing signature, bad key, malformed JSON, queue overflow, oversize body, dedicated-secret isolation, per-tenant queueing, message-id dedup, claim visibility + redelivery after expiry, idempotent ack).
+80 unit tests cover HMAC verification, all ten endpoints, end-to-end push/pull loops for pre-call, post-call, SMS relay (push → claim → ack), and the action bridge (tool dispatch, notes queue pull → ack), and failure modes (missing signature, bad key, malformed JSON, queue overflow, oversize body, dedicated-secret isolation, per-tenant queueing, message-id dedup, claim visibility + redelivery after expiry, idempotent ack, unknown-tool handling, empty-note no-op, notes-queue eviction).
 
 ## License
 

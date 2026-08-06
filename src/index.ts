@@ -42,6 +42,25 @@
  *  - POST /hermes/ack-sms         Consumer acks processed texts ({messageIds})
  *                                 so they're removed for good. The other half
  *                                 of at-least-once delivery. Idempotent.
+ *  - POST /agentcall/action       AgentCall's action bridge POSTs tool calls
+ *                                 here mid-conversation (SMS or voice) when a
+ *                                 number declares tools + this actionWebhook.
+ *                                 Verifies HMAC, dispatches synchronously
+ *                                 (must answer inside the tool timeout):
+ *                                   get_latest_brief — returns the same KV
+ *                                     context block /agentcall/precall serves,
+ *                                     so the agent can refresh mid-thread.
+ *                                   save_note — appends the note to a bounded
+ *                                     per-tenant KV queue for Hermes to pull.
+ *                                 Responds {result: string} (AgentCall feeds it
+ *                                 back to the LLM verbatim).
+ *  - POST /hermes/pull-notes      Hermes polls this to read queued notes. Does
+ *                                 NOT delete on read — notes stay until acked,
+ *                                 so a crashed consumer never loses one
+ *                                 (duplicates until ack are harmless; dedup on
+ *                                 note id). X-Hermes-Push-Key protected.
+ *  - POST /hermes/ack-notes       Consumer acks processed notes ({noteIds}) so
+ *                                 they're removed for good. Idempotent.
  *  - GET  /healthz                Liveness probe.
  *
  * Known gaps tracked for follow-up PRs:
@@ -60,6 +79,10 @@ export interface Env {
   // AGENTCALL_SIGNING_SECRET when unset, so existing single-secret deployments
   // keep working unchanged.
   AGENTCALL_SMS_SIGNING_SECRET?: string
+  // Optional dedicated secret for the action bridge (/agentcall/action), same
+  // rotation-isolation rationale as the SMS secret. Falls back to
+  // AGENTCALL_SIGNING_SECRET when unset.
+  AGENTCALL_ACTION_SIGNING_SECRET?: string
   HERMES_PUSH_KEY: string
 }
 
@@ -89,6 +112,9 @@ const MAX_QUEUED_SMS_PER_TENANT = 200
 // above that or a slow brain gets the text redelivered and runs twice. 300s
 // gives generous headroom; redelivery only kicks in on a genuine stall/crash.
 const SMS_VISIBILITY_MS = 300000
+const NOTES_QUEUE_PREFIX = 'notes_queue:'
+const MAX_QUEUED_NOTES_PER_TENANT = 200
+const MAX_NOTE_CHARS = 2000
 
 /**
  * Constant-time string comparison. Returns true iff a === b after comparing
@@ -320,7 +346,7 @@ export async function handleHermesPullTranscripts(request: Request, env: Env): P
  * AgentCall's POST /v1/sms-conversations/:id/reply, keeping the whole thread
  * (and STOP handling) inside AgentCall. Mirrors handleTranscript.
  *
- * Relay envelope shape (AgentCall sms.relay webhook):
+ * Relay envelope shape (see apps/api/src/services/agent-relay.ts):
  *   { message: {id,from,to,body,receivedAt},
  *     conversation: {id,contactPhone},
  *     context: {channel:'sms',numberId,agentId} }
@@ -491,6 +517,139 @@ export async function handleHermesAckSms(request: Request, env: Env): Promise<Re
   return jsonResponse({ status: 'ok', removed })
 }
 
+/**
+ * AgentCall action bridge. The agent (SMS or voice) invokes a declared tool;
+ * AgentCall HMAC-POSTs {tool, arguments, context} here and feeds the returned
+ * {result} string back to the LLM. Everything must complete synchronously
+ * inside the tool timeout (max 8s), so only KV-backed tools live here.
+ *
+ * Unknown tools return 200 with an explanatory result rather than an error:
+ * the LLM reads it and tells the human, which beats a generic "tool
+ * unavailable" from AgentCall's fail-soft path.
+ */
+export async function handleAgentcallAction(request: Request, env: Env): Promise<Response> {
+  const body = await request.text()
+  const signature = request.headers.get('X-AgentCall-Signature')
+  const actionSecret = env.AGENTCALL_ACTION_SIGNING_SECRET || env.AGENTCALL_SIGNING_SECRET
+  const valid = await verifyHmacSignature(body, signature, actionSecret)
+  if (!valid) {
+    return jsonResponse({ error: 'invalid_signature' }, 401)
+  }
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(body)
+  } catch {
+    return jsonResponse({ error: 'invalid_json' }, 400)
+  }
+
+  const envelope = parsed as {
+    tool?: unknown
+    arguments?: Record<string, unknown>
+    context?: { channel?: unknown; contact?: { phone?: unknown } }
+  }
+  const tool = typeof envelope.tool === 'string' ? envelope.tool : ''
+
+  if (tool === 'get_latest_brief') {
+    const stored = await env.HERMES_CONTEXT.get(KV_KEY)
+    return jsonResponse({
+      result: stored?.trim()
+        ? stored
+        : 'No brief is available right now. Hermes has not pushed context recently.',
+    })
+  }
+
+  if (tool === 'save_note') {
+    const rawNote = envelope.arguments?.note
+    const note = typeof rawNote === 'string' ? rawNote.trim().slice(0, MAX_NOTE_CHARS) : ''
+    if (!note) {
+      return jsonResponse({ result: 'Nothing to save: the note text was empty.' })
+    }
+    const tenant = extractSmsTenant(parsed)
+    const queueKey = `${NOTES_QUEUE_PREFIX}${tenant}`
+    const stored = await env.HERMES_CONTEXT.get(queueKey)
+    const queue: unknown[] = stored ? safeParseArray(stored) : []
+    queue.push({
+      id: `note_${Date.now()}_${crypto.randomUUID().slice(0, 8)}`,
+      note,
+      savedAt: new Date().toISOString(),
+      channel: typeof envelope.context?.channel === 'string' ? envelope.context.channel : null,
+      contactPhone:
+        typeof envelope.context?.contact?.phone === 'string' ? envelope.context.contact.phone : null,
+    })
+    if (queue.length > MAX_QUEUED_NOTES_PER_TENANT) {
+      queue.splice(0, queue.length - MAX_QUEUED_NOTES_PER_TENANT)
+    }
+    await env.HERMES_CONTEXT.put(queueKey, JSON.stringify(queue))
+    return jsonResponse({ result: 'Note saved. Laura will see it next time Hermes syncs.' })
+  }
+
+  return jsonResponse({ result: `Unknown tool '${tool}' on this bridge.` })
+}
+
+/**
+ * Read queued notes across all per-tenant queues. Unlike the SMS pull there is
+ * no claim step: notes are returned every poll until acked. Losing a note on a
+ * consumer crash is unacceptable; seeing one twice is harmless (Hermes dedups
+ * on note id). push-key auth.
+ */
+export async function handleHermesPullNotes(request: Request, env: Env): Promise<Response> {
+  const key = request.headers.get('X-Hermes-Push-Key')
+  if (!key || !timingSafeEqualString(key, env.HERMES_PUSH_KEY)) {
+    return jsonResponse({ error: 'unauthorized' }, 401)
+  }
+  const list = await env.HERMES_CONTEXT.list({ prefix: NOTES_QUEUE_PREFIX })
+  const allNotes: unknown[] = []
+  const tenantsDelivered: string[] = []
+  for (const entry of list.keys) {
+    const stored = await env.HERMES_CONTEXT.get(entry.name)
+    if (!stored) continue
+    const queue = safeParseArray(stored)
+    if (queue.length === 0) continue
+    allNotes.push(...queue)
+    tenantsDelivered.push(entry.name.slice(NOTES_QUEUE_PREFIX.length))
+  }
+  return jsonResponse({ notes: allNotes, count: allNotes.length, tenantsDelivered })
+}
+
+/** Remove acked notes for good. Body: {noteIds: string[]}. Idempotent. */
+export async function handleHermesAckNotes(request: Request, env: Env): Promise<Response> {
+  const key = request.headers.get('X-Hermes-Push-Key')
+  if (!key || !timingSafeEqualString(key, env.HERMES_PUSH_KEY)) {
+    return jsonResponse({ error: 'unauthorized' }, 401)
+  }
+  let parsed: unknown
+  try {
+    parsed = await request.json()
+  } catch {
+    return jsonResponse({ error: 'invalid_json' }, 400)
+  }
+  const rawIds = (parsed as { noteIds?: unknown })?.noteIds
+  const ids = Array.isArray(rawIds) ? rawIds.filter((x): x is string => typeof x === 'string') : []
+  if (ids.length === 0) {
+    return jsonResponse({ error: 'noteIds_required' }, 400)
+  }
+  const idSet = new Set(ids)
+  const list = await env.HERMES_CONTEXT.list({ prefix: NOTES_QUEUE_PREFIX })
+  let removed = 0
+  for (const entry of list.keys) {
+    const stored = await env.HERMES_CONTEXT.get(entry.name)
+    if (!stored) continue
+    const queue = safeParseArray(stored)
+    const kept = queue.filter((item) => {
+      const id = (item as { id?: unknown })?.id
+      if (typeof id === 'string' && idSet.has(id)) {
+        removed++
+        return false
+      }
+      return true
+    })
+    if (kept.length !== queue.length) {
+      await env.HERMES_CONTEXT.put(entry.name, JSON.stringify(kept))
+    }
+  }
+  return jsonResponse({ status: 'ok', removed })
+}
+
 function safeParseArray(raw: string): unknown[] {
   try {
     const parsed = JSON.parse(raw)
@@ -531,6 +690,15 @@ export default {
     }
     if (url.pathname === '/hermes/pull-sms' && request.method === 'POST') {
       return handleHermesPullSms(request, env)
+    }
+    if (url.pathname === '/agentcall/action' && request.method === 'POST') {
+      return handleAgentcallAction(request, env)
+    }
+    if (url.pathname === '/hermes/pull-notes' && request.method === 'POST') {
+      return handleHermesPullNotes(request, env)
+    }
+    if (url.pathname === '/hermes/ack-notes' && request.method === 'POST') {
+      return handleHermesAckNotes(request, env)
     }
     if (url.pathname === '/hermes/ack-sms' && request.method === 'POST') {
       return handleHermesAckSms(request, env)

@@ -1,6 +1,6 @@
 {
   "name": "agentcall-hermes-bridge",
-  "version": "0.3.0",
+  "version": "0.4.0",
   "description": "Cloudflare Worker that bridges AgentCall to your AI agent platform. Pre-call: serves today's brief on inbound calls. Post-call: queues transcripts for the agent to pull. See https://agentcall.co/docs/hermes and https://agentcall.co/docs/post-call-webhook.",
   "type": "module",
   "license": "MIT",
