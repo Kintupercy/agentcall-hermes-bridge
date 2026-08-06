@@ -1110,3 +1110,187 @@ describe('worker.fetch (SMS relay routing + e2e)', () => {
     expect(JSON.parse((await env.HERMES_CONTEXT.get('sms_queue:a1'))!)).toEqual([])
   })
 })
+
+describe('handleAgentcallAction', () => {
+  const actionUrl = 'https://hermes.agentcall.co/agentcall/action'
+
+  async function signedActionRequest(payload: unknown, secret = SIGNING_SECRET) {
+    const body = JSON.stringify(payload)
+    return new Request(actionUrl, {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'X-AgentCall-Signature': await hmac(body, secret),
+      },
+      body,
+    })
+  }
+
+  it('rejects an unsigned request', async () => {
+    const env = createEnv()
+    const req = new Request(actionUrl, { method: 'POST', body: '{}' })
+    const res = await worker.fetch(req, env)
+    expect(res.status).toBe(401)
+  })
+
+  it('prefers the dedicated action secret when set (shared secret then fails)', async () => {
+    const env = createEnv()
+    env.AGENTCALL_ACTION_SIGNING_SECRET = 'dedicated_action_secret_for_tests'
+    const sharedSigned = await signedActionRequest({ tool: 'get_latest_brief' }, SIGNING_SECRET)
+    expect((await worker.fetch(sharedSigned, env)).status).toBe(401)
+    const dedicatedSigned = await signedActionRequest(
+      { tool: 'get_latest_brief' },
+      'dedicated_action_secret_for_tests',
+    )
+    expect((await worker.fetch(dedicatedSigned, env)).status).toBe(200)
+  })
+
+  it('get_latest_brief returns the stored context block', async () => {
+    const env = createEnv()
+    await env.HERMES_CONTEXT.put('current', 'Priorities: ship the demo.')
+    const res = await worker.fetch(
+      await signedActionRequest({ tool: 'get_latest_brief', arguments: {} }),
+      env,
+    )
+    expect(res.status).toBe(200)
+    expect(((await res.json()) as { result: string }).result).toBe('Priorities: ship the demo.')
+  })
+
+  it('get_latest_brief degrades gracefully when no brief is stored', async () => {
+    const env = createEnv()
+    const res = await worker.fetch(await signedActionRequest({ tool: 'get_latest_brief' }), env)
+    const { result } = (await res.json()) as { result: string }
+    expect(result).toContain('No brief is available')
+  })
+
+  it('save_note queues the note per tenant with id, timestamp, and context', async () => {
+    const env = createEnv()
+    const res = await worker.fetch(
+      await signedActionRequest({
+        tool: 'save_note',
+        arguments: { note: 'Follow up with the spa lead Friday.' },
+        context: { channel: 'sms', agentId: 'agentX', contact: { phone: '+13146006254' } },
+      }),
+      env,
+    )
+    expect(res.status).toBe(200)
+    expect(((await res.json()) as { result: string }).result).toContain('Note saved')
+    const queue = JSON.parse((await env.HERMES_CONTEXT.get('notes_queue:agentX'))!) as Array<{
+      id: string
+      note: string
+      savedAt: string
+      channel: string
+      contactPhone: string
+    }>
+    expect(queue).toHaveLength(1)
+    expect(queue[0].note).toBe('Follow up with the spa lead Friday.')
+    expect(queue[0].id).toMatch(/^note_/)
+    expect(queue[0].channel).toBe('sms')
+    expect(queue[0].contactPhone).toBe('+13146006254')
+  })
+
+  it('save_note with empty note text replies without writing', async () => {
+    const env = createEnv()
+    const res = await worker.fetch(
+      await signedActionRequest({
+        tool: 'save_note',
+        arguments: { note: '   ' },
+        context: { channel: 'sms', agentId: 'agentX' },
+      }),
+      env,
+    )
+    expect(((await res.json()) as { result: string }).result).toContain('empty')
+    expect(await env.HERMES_CONTEXT.get('notes_queue:agentX')).toBeNull()
+  })
+
+  it('caps the per-tenant notes queue (oldest evicted)', async () => {
+    const env = createEnv()
+    const existing = Array.from({ length: 200 }, (_, i) => ({ id: `note_old_${i}`, note: 'x' }))
+    await env.HERMES_CONTEXT.put('notes_queue:agentX', JSON.stringify(existing))
+    await worker.fetch(
+      await signedActionRequest({
+        tool: 'save_note',
+        arguments: { note: 'newest' },
+        context: { channel: 'sms', agentId: 'agentX' },
+      }),
+      env,
+    )
+    const queue = JSON.parse((await env.HERMES_CONTEXT.get('notes_queue:agentX'))!) as Array<{
+      id: string
+      note: string
+    }>
+    expect(queue).toHaveLength(200)
+    expect(queue[0].id).toBe('note_old_1')
+    expect(queue[199].note).toBe('newest')
+  })
+
+  it('unknown tool returns 200 with an explanatory result (LLM-readable, not fail-soft)', async () => {
+    const env = createEnv()
+    const res = await worker.fetch(
+      await signedActionRequest({ tool: 'send_rocket', arguments: {} }),
+      env,
+    )
+    expect(res.status).toBe(200)
+    expect(((await res.json()) as { result: string }).result).toContain("Unknown tool 'send_rocket'")
+  })
+})
+
+describe('notes pull + ack', () => {
+  it('pull requires the push key', async () => {
+    const env = createEnv()
+    const res = await worker.fetch(
+      new Request('https://hermes.agentcall.co/hermes/pull-notes', { method: 'POST' }),
+      env,
+    )
+    expect(res.status).toBe(401)
+  })
+
+  it('pull returns notes without deleting; ack removes them for good', async () => {
+    const env = createEnv()
+    await env.HERMES_CONTEXT.put(
+      'notes_queue:agentX',
+      JSON.stringify([{ id: 'note_1', note: 'a' }, { id: 'note_2', note: 'b' }]),
+    )
+    const mkPull = () =>
+      new Request('https://hermes.agentcall.co/hermes/pull-notes', {
+        method: 'POST',
+        headers: { 'X-Hermes-Push-Key': PUSH_KEY },
+      })
+
+    const first = (await (await worker.fetch(mkPull(), env)).json()) as { notes: unknown[]; count: number }
+    expect(first.count).toBe(2)
+    const second = (await (await worker.fetch(mkPull(), env)).json()) as { count: number }
+    expect(second.count).toBe(2)
+
+    const ack = new Request('https://hermes.agentcall.co/hermes/ack-notes', {
+      method: 'POST',
+      headers: { 'X-Hermes-Push-Key': PUSH_KEY, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ noteIds: ['note_1'] }),
+    })
+    const ackJson = (await (await worker.fetch(ack, env)).json()) as { removed: number }
+    expect(ackJson.removed).toBe(1)
+    const remaining = (await (await worker.fetch(mkPull(), env)).json()) as {
+      notes: Array<{ id: string }>
+      count: number
+    }
+    expect(remaining.count).toBe(1)
+    expect(remaining.notes[0].id).toBe('note_2')
+  })
+
+  it('ack with no ids is a 400; unknown ids are a no-op', async () => {
+    const env = createEnv()
+    await env.HERMES_CONTEXT.put('notes_queue:agentX', JSON.stringify([{ id: 'note_1', note: 'a' }]))
+    const mkAck = (body: unknown) =>
+      new Request('https://hermes.agentcall.co/hermes/ack-notes', {
+        method: 'POST',
+        headers: { 'X-Hermes-Push-Key': PUSH_KEY, 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+      })
+    expect((await worker.fetch(mkAck({}), env)).status).toBe(400)
+    const unknown = (await (await worker.fetch(mkAck({ noteIds: ['nope'] }), env)).json()) as {
+      removed: number
+    }
+    expect(unknown.removed).toBe(0)
+    expect(JSON.parse((await env.HERMES_CONTEXT.get('notes_queue:agentX'))!)).toHaveLength(1)
+  })
+})
