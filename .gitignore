@@ -16,7 +16,8 @@ consumer/state.json
 __pycache__/
 *.pyc
 
-# bootstrap.sh output: generated secrets, rollback commands, config backup
-.bootstrap-secrets
-.bootstrap-rollback
+# bootstrap.sh per-run state: unrecoverable secrets, rollback commands, and
+# the config each run deployed with. Namespaced by account + worker name so
+# bootstrapping a second client never overwrites the first one's recovery data.
+.bootstrap/
 wrangler.jsonc.bak

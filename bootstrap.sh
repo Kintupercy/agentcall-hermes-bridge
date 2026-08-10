@@ -5,19 +5,22 @@
 #   ./bootstrap.sh                          # deploy to a workers.dev URL
 #   ./bootstrap.sh --domain hermes.you.com  # deploy to your own subdomain
 #   ./bootstrap.sh --dry-run                # print every command, run nothing
-#   ./bootstrap.sh --install-consumer       # then install the consumer too
+#   ./bootstrap.sh --install-consumer --number-id num_x --allow +1555...
 #
-# What it removes from your setup list: creating the KV namespace, editing
-# wrangler.jsonc, inventing and installing three secrets, deploying, finding
+# What it removes from your setup list: creating the KV namespace, writing
+# wrangler config, inventing and installing three secrets, deploying, finding
 # the resulting URL, and copying that URL and those secrets into the consumer.
 #
 # It defaults to a **workers.dev** URL, which needs no domain and no DNS. That
 # is a real HTTPS endpoint and AgentCall does not care what it is called. Pass
-# --domain only if you specifically want the bridge on your own hostname; that
-# requires the domain to already be on this Cloudflare account.
+# --domain only if you want the bridge on your own hostname; that zone must
+# already be on this Cloudflare account.
 #
-# Nothing here is destructive except overwriting wrangler.jsonc, which is
-# backed up first.
+# EVERY run keeps its own state under .bootstrap/<account-id>/<worker-name>/,
+# so running this repeatedly (several clients, one checkout) never overwrites
+# an earlier run's recovery secrets, rollback commands, or config. The
+# generated config is passed to wrangler with --config; the repo's own
+# wrangler.jsonc is left alone.
 
 set -euo pipefail
 
@@ -28,21 +31,16 @@ INSTALL_CONSUMER=0
 ASSUME_YES=0
 SHOW_SECRETS=0
 ALLOW_ANYONE=0
-REUSE=0
+FORCE_REPLACE=0
+NUMBER_ID=""
+ALLOW=()
 KV_ID=""
+ROLLBACK_STEPS=()   # creation order; emitted reversed so teardown is safe
 
 say()  { printf '%s\n' "$*"; }
 step() { printf '\n== %s\n' "$*"; }
 warn() { printf 'warning: %s\n' "$*" >&2; }
 die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
-
-run() { # run <description> <command...>
-  if [ "$DRY_RUN" -eq 1 ]; then
-    printf '  would run: %s\n' "$*"
-    return 0
-  fi
-  "$@"
-}
 
 usage() {
   cat <<'USAGE'
@@ -59,20 +57,24 @@ Bootstrap the AgentCall Hermes bridge on Cloudflare.
                        reach your agent (repeatable)
   --allow-anyone       instead of --allow: let ANYONE who texts the number
                        reach your agent. Read the warning it prints.
-  --reuse              deploy over an existing Worker of this name instead of
-                       refusing (this REPLACES its secrets)
+  --force-replace      deploy over an EXISTING Worker of this name. This
+                       REPLACES its secrets and is NOT undoable: Cloudflare
+                       never discloses the old values. Refused by default.
   --show-secrets       also print the generated secrets to stdout. Off by
                        default: they go to a 0600 file instead.
   --dry-run            print every command without running any of them
   --yes                do not pause for confirmation
+
+State per run:  .bootstrap/<account-id>/<worker-name>/
+                  secrets.env     0600, the values Cloudflare will not show again
+                  rollback.sh     deletes what this run created, in safe order
+                  wrangler.jsonc  the config this run deployed with
 
 Requires: node, npx, and a wrangler login (run `npx wrangler login` first).
 USAGE
   exit 0
 }
 
-NUMBER_ID=""
-ALLOW=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --name)             NAME="${2:-}"; shift 2 ;;
@@ -82,7 +84,10 @@ while [ $# -gt 0 ]; do
     --allow)            ALLOW+=("${2:-}"); shift 2 ;;
     --allow-anyone)     ALLOW_ANYONE=1; shift ;;
     --show-secrets)     SHOW_SECRETS=1; shift ;;
-    --reuse)            REUSE=1; shift ;;
+    --force-replace)    FORCE_REPLACE=1; shift ;;
+    --reuse)            FORCE_REPLACE=1
+                        warn "--reuse is now --force-replace (it replaces secrets and cannot be undone)"
+                        shift ;;
     --dry-run)          DRY_RUN=1; shift ;;
     --yes|-y)           ASSUME_YES=1; shift ;;
     --help|-h)          usage ;;
@@ -91,6 +96,7 @@ while [ $# -gt 0 ]; do
 done
 
 cd "$(dirname "$0")"
+REPO_DIR="$(pwd)"
 
 # --- refuse an unsafe or half-finished setup up front -----------------------
 # Better to fail before creating anything than to leave a deployed bridge and a
@@ -121,58 +127,84 @@ command -v node >/dev/null 2>&1 || die "node is required (https://nodejs.org)"
 say "  node       $(node --version)"
 
 WRANGLER="npx wrangler"
-if ! $WRANGLER --version >/dev/null 2>&1; then
-  die "wrangler is not available. Run 'npm install' in this directory first."
-fi
+$WRANGLER --version >/dev/null 2>&1 || die "wrangler unavailable. Run 'npm install' here first."
 say "  wrangler   $($WRANGLER --version 2>/dev/null | tail -1)"
 
+ACCOUNT_ID="dry-run-account"
 if [ "$DRY_RUN" -eq 0 ]; then
   WHOAMI="$($WRANGLER whoami 2>&1 || true)"
   case "$WHOAMI" in
-    *"You are logged in"*) say "  cloudflare $(printf '%s' "$WHOAMI" | grep -o '[^ ]*@[^ .]*\.[^ .]*' | head -1)" ;;
+    *"You are logged in"*) : ;;
     *) die "not logged in to Cloudflare. Run: npx wrangler login" ;;
   esac
+  say "  cloudflare $(printf '%s' "$WHOAMI" | grep -o '[^ ]*@[^ .]*\.[^ .]*' | head -1)"
+  # Account id namespaces the local state, so the same worker name under two
+  # different Cloudflare accounts never collides on disk.
+  ACCOUNT_ID="$(printf '%s' "$WHOAMI" | grep -oE '[0-9a-f]{32}' | head -1 || true)"
+  [ -n "$ACCOUNT_ID" ] || ACCOUNT_ID="unknown-account"
 fi
 
 [ -f package.json ] || die "run this from the agentcall-hermes-bridge checkout"
 if [ ! -d node_modules ]; then
   step "Installing dependencies"
-  run npm install
+  [ "$DRY_RUN" -eq 1 ] && say "  would run: npm install" || npm install
+fi
+
+# --- per-run state ----------------------------------------------------------
+# Namespaced by account AND worker name. A developer bootstrapping a second
+# client from this same checkout must not overwrite the first client's
+# unrecoverable secrets or their rollback commands.
+
+BOOT_DIR="$REPO_DIR/.bootstrap/$ACCOUNT_ID/$NAME"
+CONFIG_FILE="$BOOT_DIR/wrangler.jsonc"
+SECRETS_FILE="$BOOT_DIR/secrets.env"
+ROLLBACK_FILE="$BOOT_DIR/rollback.sh"
+
+step "Run state"
+say "  directory  ${BOOT_DIR#$REPO_DIR/}"
+if [ "$DRY_RUN" -eq 0 ]; then
+  if [ -e "$SECRETS_FILE" ] && [ "$FORCE_REPLACE" -eq 0 ]; then
+    die "$SECRETS_FILE already exists.
+
+     A previous bootstrap of '$NAME' on this account left secrets there, and
+     Cloudflare will never show them again, so this run will not overwrite it.
+     Use a different --name, or move that directory aside deliberately."
+  fi
+  mkdir -p "$BOOT_DIR"
 fi
 
 # --- do not silently take over an existing Worker ---------------------------
 # `wrangler deploy` UPDATES a Worker of the same name, and the secret writes
-# below REPLACE its secrets. On the default name that is easy to do to a bridge
-# someone is already using: their AgentCall numbers keep signing with the old
-# secret and every text starts failing signature verification.
+# below REPLACE its secrets. On a bridge already in use that is not a cosmetic
+# clash: its AgentCall numbers keep signing with the old secret, so every text
+# starts failing signature verification.
 
-if [ "$DRY_RUN" -eq 0 ] && [ "$REUSE" -eq 0 ]; then
-  step "Checking the Worker name is free"
+PREV_VERSION=""
+if [ "$DRY_RUN" -eq 0 ]; then
+  step "Checking the Worker name"
   if $WRANGLER deployments list --name "$NAME" >/dev/null 2>&1; then
-    die "a Worker named '$NAME' already exists on this account.
+    if [ "$FORCE_REPLACE" -eq 0 ]; then
+      die "a Worker named '$NAME' already exists on this account.
 
      Deploying over it would replace its secrets, and any AgentCall number
      pointed at it would start failing signature verification on every text.
 
-     Either pick another name:   --name hermes-bridge-2
-     or deliberately reuse it:   --reuse   (REPLACES its secrets; you will then
-                                            need to re-run configure-number with
-                                            the new signing secret)"
+     Either pick another name:    --name hermes-bridge-2
+     or replace it deliberately:  --force-replace"
+    fi
+    PREV_VERSION="$($WRANGLER deployments list --name "$NAME" 2>/dev/null \
+      | grep -oE '[0-9a-f-]{36}' | head -1 || true)"
+    warn "REPLACING the existing Worker '$NAME'."
+    warn "Its current secrets will be overwritten and Cloudflare does not"
+    warn "disclose the old values, so this is NOT undoable. Any number pointed"
+    warn "at it must be re-run through configure-number with the new secret."
+    [ -n "$PREV_VERSION" ] && warn "Previous version id recorded: $PREV_VERSION"
+  else
+    say "  '$NAME' is free"
   fi
-  say "  '$NAME' is free"
 fi
 
-# Anything created from here on is recorded, so a half-finished run can be
-# undone without hunting through the Cloudflare dashboard.
-ROLLBACK_FILE="$(pwd)/.bootstrap-rollback"
-record_rollback() { # record_rollback <human line>
-  [ "$DRY_RUN" -eq 1 ] && return 0
-  printf '%s\n' "$1" >> "$ROLLBACK_FILE"
-}
-if [ "$DRY_RUN" -eq 0 ]; then
-  : > "$ROLLBACK_FILE"
-  record_rollback "# Undo this bootstrap run ($(date -u +%Y-%m-%dT%H:%M:%SZ)), newest first:"
-fi
+record_rollback() { ROLLBACK_STEPS+=("$1"); }
 
 # --- confirm ----------------------------------------------------------------
 
@@ -181,7 +213,7 @@ TARGET_DESC="a workers.dev URL (no domain needed)"
 
 if [ "$DRY_RUN" -eq 0 ] && [ "$ASSUME_YES" -eq 0 ] && [ -r /dev/tty ]; then
   step "About to create real Cloudflare resources"
-  say "  worker     $NAME"
+  say "  worker     $NAME$([ "$FORCE_REPLACE" -eq 1 ] && printf '  (REPLACING an existing one)')"
   say "  endpoint   $TARGET_DESC"
   say "  KV         a namespace bound as HERMES_CONTEXT"
   say "  secrets    AGENTCALL_SIGNING_SECRET, AGENTCALL_SMS_SIGNING_SECRET, HERMES_PUSH_KEY"
@@ -194,35 +226,34 @@ fi
 
 step "KV namespace"
 if [ "$DRY_RUN" -eq 1 ]; then
-  printf '  would run: %s kv namespace create HERMES_CONTEXT\n' "$WRANGLER"
+  say "  would run: $WRANGLER kv namespace create HERMES_CONTEXT"
   KV_ID="DRY_RUN_KV_ID"
 else
+  # No --config here: the config does not exist yet, and it would reference the
+  # very namespace this call is creating.
   KV_OUT="$($WRANGLER kv namespace create HERMES_CONTEXT 2>&1 || true)"
-  # wrangler has changed this output format repeatedly (toml block, jsonc
-  # block, quoted vs bare). A 32-hex id is the stable part, so take that.
+  # wrangler has changed this output repeatedly (toml block, jsonc block,
+  # quoted vs bare). A 32-hex id is the stable part, so take that.
   KV_ID="$(printf '%s' "$KV_OUT" | grep -oE '[0-9a-f]{32}' | head -1 || true)"
   if [ -z "$KV_ID" ]; then
     say "$KV_OUT"
-    die "could not find a namespace id in the wrangler output above. Create one
-     manually with: npx wrangler kv namespace create HERMES_CONTEXT
-     then re-run with the id pasted into wrangler.jsonc."
+    die "could not find a namespace id in the wrangler output above."
   fi
   say "  created    id $KV_ID"
-  record_rollback "npx wrangler kv namespace delete --namespace-id $KV_ID   # KV"
+  record_rollback "npx wrangler kv namespace delete --namespace-id $KV_ID"
 fi
 
-# --- wrangler.jsonc ---------------------------------------------------------
+# --- config -----------------------------------------------------------------
+# Written into the per-run directory and passed with --config, so the repo's
+# own wrangler.jsonc is never rewritten and two clients never share one file.
+# `main` is ABSOLUTE because wrangler resolves it relative to the CONFIG file,
+# not the working directory, and the config no longer sits at the repo root.
 
-step "Writing wrangler.jsonc"
-if [ -f wrangler.jsonc ] && [ "$DRY_RUN" -eq 0 ]; then
-  cp wrangler.jsonc wrangler.jsonc.bak
-  say "  backed up  wrangler.jsonc.bak"
-fi
-
+step "Config"
 if [ -n "$DOMAIN" ]; then
   # BARE hostname, no "/*". The wildcard form is for Worker Routes; wrangler
-  # rejects it on a Custom Domain, and the config is valid JSON either way, so
-  # only a real deploy surfaces the mistake.
+  # rejects it on a Custom Domain, and both forms are valid JSON, so only a
+  # real deploy surfaces the mistake.
   DOMAIN="${DOMAIN%/\*}"; DOMAIN="${DOMAIN%/}"
   ROUTES=$(printf '  "routes": [\n    { "pattern": "%s", "custom_domain": true }\n  ],' "$DOMAIN")
   WORKERS_DEV='  "workers_dev": false,'
@@ -231,11 +262,10 @@ else
   WORKERS_DEV='  "workers_dev": true,'
 fi
 
-WRANGLER_JSONC=$(cat <<EOF
+CONFIG_JSON=$(cat <<EOF
 {
-  "\$schema": "node_modules/wrangler/config-schema.json",
   "name": "$NAME",
-  "main": "src/index.ts",
+  "main": "$REPO_DIR/src/index.ts",
   "compatibility_date": "2025-05-05",
   "compatibility_flags": ["nodejs_compat"],
 $WORKERS_DEV
@@ -250,12 +280,14 @@ $ROUTES
 EOF
 )
 if [ "$DRY_RUN" -eq 1 ]; then
-  say "  would write wrangler.jsonc:"
-  printf '%s\n' "$WRANGLER_JSONC" | sed 's/^/    /'
+  say "  would write ${CONFIG_FILE#$REPO_DIR/}:"
+  printf '%s\n' "$CONFIG_JSON" | sed 's/^/    /'
 else
-  printf '%s\n' "$WRANGLER_JSONC" > wrangler.jsonc
-  say "  wrote      wrangler.jsonc ($NAME -> ${DOMAIN:-workers.dev})"
+  printf '%s\n' "$CONFIG_JSON" > "$CONFIG_FILE"
+  say "  wrote      ${CONFIG_FILE#$REPO_DIR/} ($NAME -> ${DOMAIN:-workers.dev})"
 fi
+
+WR_CONF=(--config "$CONFIG_FILE")
 
 # --- secrets ----------------------------------------------------------------
 
@@ -271,13 +303,13 @@ HERMES_PUSH_KEY="$(gen_secret)"
 
 put_secret() { # put_secret NAME VALUE
   if [ "$DRY_RUN" -eq 1 ]; then
-    printf '  would run: printf ... | %s secret put %s\n' "$WRANGLER" "$1"
+    say "  would run: printf ... | $WRANGLER secret put $1 --config <run config>"
     return 0
   fi
-  if printf '%s' "$2" | $WRANGLER secret put "$1" >/dev/null 2>&1; then
+  if printf '%s' "$2" | $WRANGLER secret put "$1" "${WR_CONF[@]}" >/dev/null 2>&1; then
     say "  set        $1"
   else
-    die "could not set $1. Run '$WRANGLER secret put $1' by hand and re-run."
+    die "could not set $1. Run '$WRANGLER secret put $1 --config $CONFIG_FILE' by hand."
   fi
 }
 
@@ -291,58 +323,37 @@ put_secret HERMES_PUSH_KEY "$HERMES_PUSH_KEY"
 
 step "Deploying"
 if [ "$DRY_RUN" -eq 1 ]; then
-  printf '  would run: %s deploy\n' "$WRANGLER"
+  say "  would run: $WRANGLER deploy --config <run config>"
   BRIDGE_URL="https://$NAME.EXAMPLE.workers.dev"
   [ -n "$DOMAIN" ] && BRIDGE_URL="https://$DOMAIN"
 else
-  DEPLOY_OUT="$($WRANGLER deploy 2>&1 || true)"
+  DEPLOY_OUT="$($WRANGLER deploy "${WR_CONF[@]}" 2>&1 || true)"
   printf '%s\n' "$DEPLOY_OUT" | sed 's/^/  /' | tail -8
+  # Only offer to delete the Worker if THIS run created it. With
+  # --force-replace it already existed, and deleting it would destroy
+  # someone's bridge rather than undo anything.
+  if [ "$FORCE_REPLACE" -eq 0 ]; then
+    record_rollback "npx wrangler delete --name $NAME --force"
+  fi
   if [ -n "$DOMAIN" ]; then
     BRIDGE_URL="https://$DOMAIN"
   else
     BRIDGE_URL="$(printf '%s' "$DEPLOY_OUT" | grep -oE 'https://[a-zA-Z0-9.-]+\.workers\.dev' | head -1 || true)"
   fi
-  record_rollback "npx wrangler delete --name $NAME   # the Worker itself"
-  [ -n "$BRIDGE_URL" ] || die "deployed, but could not find the URL in the output above.
-     Find it with 'npx wrangler deployments list' and pass it to the consumer
-     installer as --bridge-url."
+  [ -n "$BRIDGE_URL" ] || die "deployed, but could not find the URL above.
+     Find it with 'npx wrangler deployments list --name $NAME'."
 fi
 
-# --- verify -----------------------------------------------------------------
+# --- write the run state ----------------------------------------------------
 
-step "Verifying"
-if [ "$DRY_RUN" -eq 1 ]; then
-  printf '  would run: curl -fsS %s/healthz\n' "$BRIDGE_URL"
-else
-  # A fresh Worker route can take a few seconds to answer.
-  HEALTH=""
-  for _ in 1 2 3 4 5 6; do
-    HEALTH="$(curl -fsS "$BRIDGE_URL/healthz" 2>/dev/null || true)"
-    [ "$HEALTH" = "ok" ] && break
-    sleep 5
-  done
-  [ "$HEALTH" = "ok" ] || die "deployed to $BRIDGE_URL but /healthz did not answer 'ok'.
-     Check 'npx wrangler tail' and the Cloudflare dashboard."
-  say "  $BRIDGE_URL/healthz -> ok"
-fi
-
-# --- hand off ---------------------------------------------------------------
-
-step "Bridge is up"
-say "  URL        $BRIDGE_URL"
-[ "$DRY_RUN" -eq 0 ] && say "  rollback   $ROLLBACK_FILE (commands to undo this run)"
-
-# Secrets go to a 0600 file, not to stdout. Terminal scrollback, CI logs, agent
-# tool output, screen recordings, and pasted support transcripts all capture
-# stdout, and Cloudflare will not show these values again, so they cannot be
-# treated as ephemeral. Written with a restrictive umask rather than
-# chmod-after-write, so the file is never briefly world-readable.
-SECRETS_FILE="$(pwd)/.bootstrap-secrets"
-if [ "$DRY_RUN" -eq 1 ]; then
-  say "  would write $SECRETS_FILE (0600)"
-else
+if [ "$DRY_RUN" -eq 0 ]; then
+  # Secrets to a 0600 file, never stdout: they are unrecoverable from
+  # Cloudflare, and stdout is captured by scrollback, CI logs, agent tool
+  # output, screen recordings, and pasted support transcripts. Restrictive
+  # umask rather than chmod-after-write, so it is never briefly world-readable.
   ( umask 077; cat > "$SECRETS_FILE" <<EOF
-# AgentCall bridge secrets, generated $(date -u +%Y-%m-%dT%H:%M:%SZ)
+# AgentCall bridge secrets for worker '$NAME'
+# account $ACCOUNT_ID, generated $(date -u +%Y-%m-%dT%H:%M:%SZ)
 # Cloudflare will not show these again. Keep or delete deliberately.
 AGENTCALL_BRIDGE_URL=$BRIDGE_URL
 AGENTCALL_SIGNING_SECRET=$AGENTCALL_SIGNING_SECRET
@@ -351,7 +362,59 @@ HERMES_PUSH_KEY=$HERMES_PUSH_KEY
 EOF
   )
   chmod 600 "$SECRETS_FILE" 2>/dev/null || true
-  say "  secrets    $SECRETS_FILE (0600, not printed)"
+
+  # Rollback runs in REVERSE creation order: the Worker goes first, then the
+  # KV namespace it was bound to. Tearing the namespace out from under a live
+  # Worker would leave it deployed and broken.
+  {
+    printf '#!/usr/bin/env bash\n'
+    printf '# Undo the bootstrap of worker "%s" on account %s\n' "$NAME" "$ACCOUNT_ID"
+    printf '# Generated %s. Reverse creation order: Worker first, then its KV.\n' \
+           "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    if [ "$FORCE_REPLACE" -eq 1 ]; then
+      printf '#\n# THIS WAS A REPLACEMENT, NOT A FRESH CREATE.\n'
+      printf '# The Worker existed before this run, so there is no delete step for it:\n'
+      printf '# deleting it would destroy the pre-existing bridge rather than undo\n'
+      printf '# anything. Its previous SECRETS cannot be restored either, because\n'
+      printf '# Cloudflare never discloses stored secret values. Restoring them needs\n'
+      printf '# your own prior backup.\n'
+      [ -n "$PREV_VERSION" ] && printf '# Previous version id: %s\n' "$PREV_VERSION"
+      printf '#   npx wrangler rollback %s --name %s\n' "${PREV_VERSION:-<version-id>}" "$NAME"
+    fi
+    printf 'set -euo pipefail\n\n'
+    for (( i=${#ROLLBACK_STEPS[@]}-1 ; i>=0 ; i-- )); do
+      printf 'echo "+ %s"\n' "${ROLLBACK_STEPS[$i]}"
+      printf '%s\n\n' "${ROLLBACK_STEPS[$i]}"
+    done
+    printf 'echo "rolled back. Local state is still in %s"\n' "$BOOT_DIR"
+  } > "$ROLLBACK_FILE"
+  chmod +x "$ROLLBACK_FILE" 2>/dev/null || true
+fi
+
+# --- verify -----------------------------------------------------------------
+
+step "Verifying"
+if [ "$DRY_RUN" -eq 1 ]; then
+  say "  would run: curl -fsS $BRIDGE_URL/healthz"
+else
+  HEALTH=""
+  for _ in 1 2 3 4 5 6; do            # a fresh route takes a moment to answer
+    HEALTH="$(curl -fsS "$BRIDGE_URL/healthz" 2>/dev/null || true)"
+    [ "$HEALTH" = "ok" ] && break
+    sleep 5
+  done
+  [ "$HEALTH" = "ok" ] || die "deployed to $BRIDGE_URL but /healthz did not answer 'ok'.
+     Check 'npx wrangler tail --name $NAME'. To undo: $ROLLBACK_FILE"
+  say "  $BRIDGE_URL/healthz -> ok"
+fi
+
+# --- hand off ---------------------------------------------------------------
+
+step "Bridge is up"
+say "  URL        $BRIDGE_URL"
+if [ "$DRY_RUN" -eq 0 ]; then
+  say "  secrets    ${SECRETS_FILE#$REPO_DIR/} (0600, not printed)"
+  say "  rollback   ${ROLLBACK_FILE#$REPO_DIR/}"
 fi
 
 if [ "$SHOW_SECRETS" -eq 1 ]; then
@@ -363,15 +426,14 @@ fi
 
 if [ "$INSTALL_CONSUMER" -eq 1 ]; then
   step "Installing the consumer"
-  # Secrets travel in the ENVIRONMENT, never argv. Command lines are readable
-  # by any user on the box via ps; an environment is readable only by the same
-  # user and root.
-  consumer_args=(--bridge-dir "$(pwd)" --number-id "$NUMBER_ID")
+  # Secrets travel in the ENVIRONMENT, never argv: command lines are readable
+  # by any user on the box via ps, environments only by the same user and root.
+  consumer_args=(--bridge-dir "$REPO_DIR" --number-id "$NUMBER_ID")
   for a in "${ALLOW[@]:-}"; do [ -n "$a" ] && consumer_args+=(--allow "$a"); done
   [ "$ALLOW_ANYONE" -eq 1 ] && consumer_args+=(--yes)
   if [ "$DRY_RUN" -eq 1 ]; then
-    printf '  would run: AGENTCALL_BRIDGE_URL=... HERMES_PUSH_KEY=... \\\n'
-    printf '             AGENTCALL_SMS_SIGNING_SECRET=... ./consumer/install.sh %s\n' "${consumer_args[*]}"
+    say "  would run: AGENTCALL_BRIDGE_URL=... HERMES_PUSH_KEY=... \\"
+    say "             AGENTCALL_SMS_SIGNING_SECRET=... ./consumer/install.sh ${consumer_args[*]}"
   else
     AGENTCALL_BRIDGE_URL="$BRIDGE_URL" \
     HERMES_PUSH_KEY="$HERMES_PUSH_KEY" \
@@ -383,10 +445,10 @@ fi
 
 say ""
 say "  Next, install the consumer next to your agent. Load the secrets from the"
-say "  file rather than typing them, so they stay out of your shell history:"
+say "  file rather than retyping them, so they stay out of your shell history:"
 say ""
-say "    set -a; . $SECRETS_FILE; set +a"
-say "    ./consumer/install.sh --bridge-dir $(pwd) \\"
+say "    set -a; . ${SECRETS_FILE#$REPO_DIR/}; set +a"
+say "    ./consumer/install.sh --bridge-dir $REPO_DIR \\"
 say "      --number-id num_xxx --allow +1XXXXXXXXXX"
 say ""
 say "  (or re-run this with --install-consumer to chain them)"
