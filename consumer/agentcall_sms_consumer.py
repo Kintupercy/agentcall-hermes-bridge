@@ -418,6 +418,51 @@ class Bridge:
             self._headers(), self.cfg.http_timeout,
         )
 
+    def probe_signature(self, signing_secret: str) -> Tuple[bool, str]:
+        """Prove the consumer's SMS signing secret matches the Worker's.
+
+        The only honest way to check: sign something and see whether the Worker
+        accepts it. Reading the number's config cannot tell you — AgentCall
+        redacts the stored secret to `hasSigningSecret: true`, which proves a
+        secret exists and nothing about WHICH one. A stale secret there is
+        invisible until a real text is silently rejected.
+
+        Non-destructive: pushes a probe envelope, then acks it straight back
+        out of the queue, so a running consumer never sees it.
+        """
+        nonce = "".join(random.choice(string.ascii_lowercase + string.digits) for _ in range(10))
+        message_id = f"msg_sigprobe_{nonce}"
+        envelope = {
+            "message": {
+                "id": message_id,
+                "from": "+10000000000",
+                "to": "+10000000000",
+                "body": "signature probe",
+                "receivedAt": now_iso(),
+            },
+            "conversation": {
+                "id": f"{SELFTEST_CONVERSATION_PREFIX}sigprobe_{nonce}",
+                "contactPhone": "+10000000000",
+            },
+            "context": {"channel": "sms", "numberId": "num_sigprobe",
+                        "agentId": "sigprobe"},
+        }
+        try:
+            res = self.push_sms(envelope, signing_secret)
+        except Exception as exc:
+            return False, str(exc)
+        # Clean up regardless of the verdict; a queued probe would otherwise
+        # wait for the consumer and show up as a stray selftest.
+        try:
+            self.ack_sms([message_id])
+        except Exception:
+            pass
+        if res.status == 401:
+            return False, "the Worker rejected the signature (401): this secret is not the Worker's"
+        if not res.ok:
+            return False, f"unexpected HTTP {res.status}: {res.body[:120]}"
+        return True, "matches the Worker"
+
     def ack_sms(self, message_ids: List[str]) -> bool:
         if not message_ids:
             return True
@@ -1109,6 +1154,20 @@ def cmd_preflight(cfg: Config, args: argparse.Namespace) -> int:
         except Exception as exc:
             checks.append(("bridge push key", False, str(exc)))
 
+    # The check that would have caught the migration failure. Everything else
+    # here can pass while the number holds a signing secret from an older
+    # bridge, and the first symptom is a real text disappearing.
+    if cfg.bridge_url and cfg.sms_signing_secret:
+        ok, detail = Bridge(cfg).probe_signature(cfg.sms_signing_secret)
+        checks.append(("SMS signing secret", ok, detail))
+    elif cfg.bridge_url:
+        checks.append((
+            "SMS signing secret", False,
+            "not set, so it cannot be verified. Set AGENTCALL_SMS_SIGNING_SECRET "
+            "to the Worker's value; without it nothing checks that your number's "
+            "stored secret still matches",
+        ))
+
     if cfg.agentcall_api_key:
         res = AgentCall(cfg).list_numbers()
         detail = f"HTTP {res.status}"
@@ -1190,12 +1249,25 @@ def cmd_selftest(cfg: Config, args: argparse.Namespace) -> int:
     }
 
     bridge = Bridge(cfg)
-    res = bridge.push_sms(envelope, cfg.sms_signing_secret)
+    # A secret written with `wrangler secret put` seconds ago has not reached
+    # every edge yet, so a 401 right after deploying is usually propagation
+    # rather than a mismatch. Retry briefly before calling it wrong.
+    deadline_push = time.time() + max(0.0, args.secret_wait)
+    while True:
+        res = bridge.push_sms(envelope, cfg.sms_signing_secret)
+        if res.ok or res.status != 401 or time.time() >= deadline_push:
+            break
+        print("  ....   401 from the bridge, retrying while the Worker secret propagates")
+        time.sleep(5)
     if not res.ok:
         print(f"  [FAIL] push to bridge          HTTP {res.status} {res.body[:200]}")
         if res.status == 401:
-            print("         The signing secret does not match the Worker's. "
-                  "Check `wrangler secret list` and AGENTCALL_SMS_SIGNING_SECRET.")
+            print("         The signing secret does not match the Worker's.")
+            print("         Fix by writing the SAME value to both sides:")
+            print("           wrangler secret put AGENTCALL_SMS_SIGNING_SECRET   (in the bridge repo)")
+            print("           agentcall_sms_consumer.py configure-number --number-id num_xxx \\")
+            print("             --signing-secret <that same value>")
+            print("         A number can report hasSigningSecret:true and still hold a stale one.")
         return 1
     print(f"  [PASS] push to bridge          {res.json()}")
     print(f"         messageId {message_id}")
@@ -1336,15 +1408,32 @@ def cmd_configure_number(cfg: Config, args: argparse.Namespace) -> int:
         return 2
 
     payload["smsMode"] = "relay"
+    # ALWAYS write the secret. Omitting it makes AgentCall keep whatever was
+    # stored, and `hasSigningSecret: true` on the read only proves *a* secret
+    # exists, never that it matches the Worker's. That is the migration trap:
+    # a number configured against an older bridge keeps its stale secret, so
+    # AgentCall happily accepts the text, signs with the old key, and the
+    # Worker rejects the push with 401. The symptom is a text that vanishes
+    # with a green config on both sides.
+    #
+    # Overwriting is safe and idempotent: the Worker and the number are meant
+    # to hold the same value, and `selftest` proves they do.
+    secret = args.signing_secret or cfg.sms_signing_secret
     agent_webhook: Dict[str, Any] = {"url": f"{bridge_url}/agentcall/sms"}
-    if args.signing_secret:
-        agent_webhook["signingSecret"] = args.signing_secret
-    elif not (isinstance(existing.get("agentWebhook"), dict)
-              and existing["agentWebhook"].get("url", "").startswith(bridge_url)):
-        print("This number has no relay webhook secret stored yet, so one is "
-              "required.")
-        print("Re-run with --signing-secret <the Worker's "
-              "AGENTCALL_SMS_SIGNING_SECRET>.")
+    if secret:
+        agent_webhook["signingSecret"] = secret
+    elif args.keep_secret:
+        print("  [WARN] --keep-secret: leaving the stored signing secret in place.")
+        print("         Nothing here has verified it matches the Worker. Run "
+              "`selftest` before trusting this number.")
+    else:
+        print("A signing secret is required, even if this number already has one.")
+        print("AgentCall cannot show you the stored secret, and a stored secret "
+              "that does not match your Worker is exactly how texts silently")
+        print("disappear. Re-run with --signing-secret <the Worker's "
+              "AGENTCALL_SMS_SIGNING_SECRET>, or set it in the config/env.")
+        print("If you genuinely want to keep the stored one unverified, pass "
+              "--keep-secret.")
         return 2
     payload["agentWebhook"] = agent_webhook
 
@@ -1408,6 +1497,9 @@ def build_parser() -> argparse.ArgumentParser:
     p_self.add_argument("--tenant", default="",
                         help="agentId to queue under (default: selftest)")
     p_self.add_argument("--timeout", type=float, default=90.0)
+    p_self.add_argument("--secret-wait", type=float, default=0.0,
+                        help="seconds to keep retrying a 401 while a freshly "
+                             "written Worker secret propagates")
 
     p_ver = sub.add_parser("verify",
                            help="live end-to-end: you text the number, this watches")
@@ -1426,6 +1518,10 @@ def build_parser() -> argparse.ArgumentParser:
                        help="clear the allowlist (anyone who texts reaches the agent)")
     p_cfg.add_argument("--system-prompt", default="",
                        help="voice prompt, required only if the number has no config yet")
+    p_cfg.add_argument("--keep-secret", action="store_true",
+                       help="leave the stored signing secret alone (UNVERIFIED: "
+                            "AgentCall cannot show it, and a stale one silently "
+                            "drops every text)")
     p_cfg.add_argument("--dry-run", action="store_true",
                        help="print the config that would be saved")
 
