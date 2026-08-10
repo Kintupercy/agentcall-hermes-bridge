@@ -283,7 +283,7 @@ npm run test:consumer  # the consumer (python3, no dependencies)
 
 80 unit tests cover the Worker: HMAC verification, all eleven endpoints, end-to-end push/pull loops for pre-call, post-call, SMS relay (push → claim → ack), and the action bridge (tool dispatch, notes queue pull → ack), and failure modes (missing signature, bad key, malformed JSON, queue overflow, oversize body, dedicated-secret isolation, per-tenant queueing, message-id dedup, claim visibility + redelivery after expiry, idempotent ack, unknown-tool handling, empty-note no-op, notes-queue eviction).
 
-71 more cover the consumer, most of them on the ack decision — the one that loses a text if it acks too early and double-texts a human if it acks too late. See [consumer/README.md](consumer/README.md#tests).
+104 more cover the consumer and the Hermes adapter, most of them on the ack decision — the one that loses a text if it acks too early and double-texts a human if it acks too late. See [consumer/README.md](consumer/README.md#tests).
 
 ## License
 

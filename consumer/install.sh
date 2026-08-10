@@ -228,15 +228,26 @@ fetch() { # fetch RELATIVE_PATH DEST
 
 fetch agentcall_sms_consumer.py "$PREFIX/agentcall_sms_consumer.py"
 fetch brains/echo_brain.sh "$PREFIX/brains/echo_brain.sh"
+fetch brains/hermes_brain.py "$PREFIX/brains/hermes_brain.py"
 fetch brains/hermes_brain.sh.example "$PREFIX/brains/hermes_brain.sh.example"
-chmod +x "$PREFIX/agentcall_sms_consumer.py" "$PREFIX/brains/echo_brain.sh"
+chmod +x "$PREFIX/agentcall_sms_consumer.py" "$PREFIX/brains/echo_brain.sh"          "$PREFIX/brains/hermes_brain.py"
 say "  installed $PREFIX/agentcall_sms_consumer.py"
 
 if [ -z "$BRAIN" ]; then
-  BRAIN="$PREFIX/brains/echo_brain.sh"
-  warn "no --brain given: using the echo brain, which replies 'Echo: <your text>'."
-  warn "Copy brains/hermes_brain.sh.example to hermes_brain.sh, wire it to your"
-  warn "agent, then set brain.command in $PREFIX/config.json."
+  # Prefer the real adapter when a hermes CLI is present: it needs no config,
+  # continues one session per SMS thread, and restricts toolsets on the SMS
+  # channel. Falling back to the echo brain only when there is no agent to
+  # reach means a working install is the default rather than a demo.
+  if command -v hermes >/dev/null 2>&1 || command -v hermes-agent >/dev/null 2>&1; then
+    BRAIN="$PREFIX/brains/hermes_brain.py"
+    say "  brain     hermes_brain.py (found a hermes CLI; sms-safe toolsets)"
+    say "            check it with: $PREFIX/brains/hermes_brain.py --selfcheck"
+  else
+    BRAIN="$PREFIX/brains/echo_brain.sh"
+    warn "no --brain given and no hermes CLI found: using the echo brain, which"
+    warn "replies 'Echo: <your text>'. Point brains/hermes_brain.py at your agent"
+    warn "(run it with --discover) and set brain.command in $PREFIX/config.json."
+  fi
 fi
 
 # --- config.json ------------------------------------------------------------

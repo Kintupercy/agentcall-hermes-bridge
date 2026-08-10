@@ -13,7 +13,7 @@
     "deploy": "wrangler deploy",
     "test": "vitest run",
     "test:watch": "vitest",
-    "test:consumer": "python3 consumer/tests/test_consumer.py",
+    "test:consumer": "python3 consumer/tests/test_consumer.py && python3 consumer/tests/test_hermes_brain.py",
     "typecheck": "tsc --noEmit"
   },
   "devDependencies": {

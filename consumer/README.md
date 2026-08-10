@@ -29,7 +29,7 @@ cd agentcall-hermes-bridge
   --api-key    "$AGENTCALL_API_KEY" \
   --sms-secret "$AGENTCALL_SMS_SIGNING_SECRET" \
   --allow      +15551234567 \
-  --brain      /opt/agentcall-sms-consumer/brains/hermes_brain.sh
+  --brain      /opt/agentcall-sms-consumer/brains/hermes_brain.py
 ```
 
 Run it with no arguments to be prompted instead. As root it installs to
@@ -46,7 +46,37 @@ cp config.example.json config.json        # bridge URL, allowlist, brain
 docker compose up -d
 ```
 
-## Write the brain
+## The brain: use the official adapter
+
+If you run Hermes, you should not write anything. `brains/hermes_brain.py` is
+the supported adapter and the installer selects it automatically when a
+`hermes` CLI is on PATH.
+
+```bash
+brains/hermes_brain.py --discover     # probe this machine, print the config
+brains/hermes_brain.py --selfcheck    # send a fake text through your agent
+```
+
+It uses `hermes -z` (one-shot: prints only the final response, approvals
+auto-bypassed, built for pipes) and adds the parts that matter on a phone:
+
+| | |
+| --- | --- |
+| **Thread continuity** | one AgentCall conversation maps to one stable `hermes -c <session>`, so a follow-up text continues the conversation instead of starting cold |
+| **SMS shaping** | tells the agent it is on SMS, then strips markdown and bounds length on the way out. Without this you get 900 characters of headings and asterisks, unreadable on a phone and several segments |
+| **Tool profile** | `sms-safe` (default) passes `-t web,memory,session_search,todo,clarify`, so `terminal`, `file`, `code_execution`, `computer_use`, `messaging`, and `cronjob` are unreachable from a channel authenticated by caller ID. `HERMES_PROFILE=full` opts out |
+| **Time discipline** | finishes inside the consumer's brain budget, because the bridge redelivers after 300s and a slow turn would be answered twice |
+| **Selftest awareness** | the consumer's synthetic probes are answered cheaply and never touch your agent's memory |
+
+The tool profile is enforced by Hermes on the command line, not requested in the
+prompt. That distinction is the whole point: a prompt is a suggestion, `-t` is a
+restriction.
+
+Not running Hermes? The same adapter speaks three other transports
+(`HERMES_URL` for an HTTP agent, `HERMES_COMMAND` for any CLI, `HERMES_CONTAINER`
+for docker). `--discover` prints the block for each.
+
+## Or write your own brain
 
 The consumer does not think. It hands the text to a command (or an HTTP
 endpoint) you point it at, and sends back whatever that returns.
@@ -289,7 +319,7 @@ journald, Docker, and support tickets.
 python3 consumer/tests/test_consumer.py
 ```
 
-71 tests, standard library, no network. They cover the ack decision for every
+104 tests, standard library, no network (71 consumer + 33 adapter). They cover the ack decision for every
 outcome (replied, brain failure, 5xx, 429, opted-out, gone, malformed),
 redelivery after a failed ack including across a restart, the allowlist, the
 brain contract on a real subprocess (stdout, exit 64, non-zero, empty output,
