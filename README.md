@@ -47,6 +47,24 @@ Most self-hosted agent platforms (Hermes, n8n, custom Python jobs, etc.) run loc
 ```bash
 git clone https://github.com/Kintupercy/agentcall-hermes-bridge.git
 cd agentcall-hermes-bridge
+npx wrangler login          # if you have not already
+./bootstrap.sh
+```
+
+That creates the KV namespace, writes `wrangler.jsonc`, generates and installs
+all three secrets, deploys, waits for `/healthz`, and prints the URL and
+secrets you need next. It defaults to a **workers.dev** URL, so you need no
+domain and no DNS; pass `--domain hermes.you.com` if you want your own
+hostname (the zone must already be on the account).
+
+Add `--install-consumer` to continue straight into installing the consumer
+next to your agent with the URL and secrets already filled in. Add `--dry-run`
+first if you would rather read every command before anything is created.
+
+<details>
+<summary>Manual setup, if you would rather do it by hand</summary>
+
+```bash
 npm install
 
 # 1. Create a KV namespace, copy the ID into wrangler.jsonc
@@ -69,6 +87,8 @@ npx wrangler deploy
 
 # 5. Add a CNAME for your custom domain in Cloudflare DNS pointing at the Worker
 ```
+
+</details>
 
 ## Verify the deploy
 
