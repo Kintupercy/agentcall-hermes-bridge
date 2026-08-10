@@ -4,8 +4,11 @@
   "main": "src/index.ts",
   "compatibility_date": "2025-05-05",
   "compatibility_flags": ["nodejs_compat"],
+  // A Custom Domain takes a BARE hostname. The "/*" wildcard form is for
+  // Worker Routes, and wrangler rejects it here. JSON validity does not catch
+  // the difference; only a deploy does.
   "routes": [
-    { "pattern": "hermes.YOUR-DOMAIN.com/*", "custom_domain": true }
+    { "pattern": "hermes.YOUR-DOMAIN.com", "custom_domain": true }
   ],
   "kv_namespaces": [
     {
