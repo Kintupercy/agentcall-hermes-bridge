@@ -8,7 +8,9 @@
 #     --api-key    "$AGENTCALL_API_KEY" \
 #     --sms-secret "$AGENTCALL_SMS_SIGNING_SECRET" \
 #     --allow      +15551234567 \
-#     --brain      /opt/agentcall-sms-consumer/brains/hermes_brain.sh
+#     --brain      /opt/agentcall-sms-consumer/brains/hermes_brain.sh \
+#     --number-id  num_xxx \
+#     --verify-live +15551234567
 #
 # Or clone the repo and run ./consumer/install.sh with no arguments to be
 # prompted for each value.
@@ -17,7 +19,10 @@
 #   1. installs the consumer to a prefix (/opt/... as root, ~/.local/... otherwise)
 #   2. writes config.json (world-readable) and consumer.env (0600, secrets)
 #   3. installs a systemd service that restarts forever
-#   4. runs preflight, and tells you what to run next
+#   4. generates the SMS signing secret if you did not supply one, and writes it
+#      to the Worker too when --bridge-dir is given
+#   5. runs preflight, then selftest, and REFUSES to claim success unless they
+#      pass. With --verify-live it also waits for a real text before saying READY
 #
 # It does NOT touch your AgentCall number unless you pass --number-id. Putting a
 # number into relay mode changes how real texts are handled, so that stays an
@@ -34,6 +39,7 @@ API_KEY=""
 SMS_SECRET=""
 BRAIN=""
 NUMBER_ID=""
+VERIFY_LIVE=""
 ALLOW=()
 PREFIX=""
 SERVICE_USER=""
@@ -55,12 +61,15 @@ usage() {
 One-command install for the AgentCall SMS relay consumer.
 
   --bridge-url URL    your deployed bridge, https://hermes.example.com
+  --bridge-dir DIR    local clone of this repo; the SMS signing secret is
+                      written to the Worker from there via wrangler
   --push-key KEY      the bridge's HERMES_PUSH_KEY
   --api-key KEY       your AgentCall API key, ac_live_...
-  --sms-secret SECRET the bridge's signing secret (enables selftest)
+  --sms-secret SECRET the bridge's signing secret (generated if omitted)
   --allow +1555...    a phone number allowed to reach your agent (repeatable)
   --brain PATH        the command that asks your agent for a reply
-  --number-id num_... also put this number into relay mode
+  --number-id num_... also put this number into relay mode, then selftest it
+  --verify-live +1... wait for a real text and only print READY if it completes
   --prefix DIR        install location
   --user NAME         run the service as an existing user
   --no-service        install files only, do not touch systemd
@@ -83,6 +92,7 @@ while [ $# -gt 0 ]; do
     --brain)      BRAIN="${2:-}"; shift 2 ;;
     --allow)      ALLOW+=("${2:-}"); shift 2 ;;
     --number-id)  NUMBER_ID="${2:-}"; shift 2 ;;
+    --verify-live) VERIFY_LIVE="${2:-}"; shift 2 ;;
     --prefix)     PREFIX="${2:-}"; shift 2 ;;
     --user)       SERVICE_USER="${2:-}"; shift 2 ;;
     --no-service) NO_SERVICE=1; shift ;;
@@ -460,6 +470,29 @@ if [ "$SELFTEST_RC" -ne 0 ]; then
   exit "$SELFTEST_RC"
 fi
 
-say "Ready. The loop is proven end to end except for the carrier."
-say "Now send a real text to your number, then run:"
+# --- the only test that proves the carrier leg -------------------------------
+
+if [ -n "$VERIFY_LIVE" ]; then
+  step "Live verification"
+  say "  Everything above is machine-checkable. This last hop is not: only a real"
+  say "  text proves the carrier, the 10DLC registration, and the number's relay"
+  say "  config all work together."
+  say ""
+  if $RUN_CMD verify --number "$VERIFY_LIVE"; then
+    say ""
+    say "READY. A real text reached your agent and your agent's reply went back out."
+    exit 0
+  fi
+  say ""
+  say "NOT READY. The synthetic loop passes but a real text did not complete."
+  say "Everything except the carrier leg is proven, so look at the number itself:"
+  say "  - is it on the Pro plan (relay is not processed on Free)"
+  say "  - is smsMode really 'relay'  ($RUN_CMD configure-number --dry-run ...)"
+  say "  - is your phone on the allowlist"
+  exit 1
+fi
+
+say "Ready for a real text. The loop is proven end to end except for the carrier."
+say "Nothing has yet proven the carrier leg, so finish with:"
 say "    $RUN_CMD verify --number +1XXXXXXXXXX"
+say "(or re-run this installer with --verify-live +1XXXXXXXXXX to have it wait)"
