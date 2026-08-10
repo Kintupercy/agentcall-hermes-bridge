@@ -26,6 +26,9 @@ DOMAIN=""
 DRY_RUN=0
 INSTALL_CONSUMER=0
 ASSUME_YES=0
+SHOW_SECRETS=0
+ALLOW_ANYONE=0
+REUSE=0
 KV_ID=""
 
 say()  { printf '%s\n' "$*"; }
@@ -50,8 +53,16 @@ Bootstrap the AgentCall Hermes bridge on Cloudflare.
                        The zone must already be on this Cloudflare account.
   --install-consumer   after deploying, run consumer/install.sh with the
                        generated URL and secrets already filled in
-  --number-id num_...  passed through to the consumer installer
-  --allow +1555...     passed through to the consumer installer (repeatable)
+  --number-id num_...  REQUIRED with --install-consumer: the number to put in
+                       relay mode
+  --allow +1555...     REQUIRED with --install-consumer: a sender allowed to
+                       reach your agent (repeatable)
+  --allow-anyone       instead of --allow: let ANYONE who texts the number
+                       reach your agent. Read the warning it prints.
+  --reuse              deploy over an existing Worker of this name instead of
+                       refusing (this REPLACES its secrets)
+  --show-secrets       also print the generated secrets to stdout. Off by
+                       default: they go to a 0600 file instead.
   --dry-run            print every command without running any of them
   --yes                do not pause for confirmation
 
@@ -69,6 +80,9 @@ while [ $# -gt 0 ]; do
     --install-consumer) INSTALL_CONSUMER=1; shift ;;
     --number-id)        NUMBER_ID="${2:-}"; shift 2 ;;
     --allow)            ALLOW+=("${2:-}"); shift 2 ;;
+    --allow-anyone)     ALLOW_ANYONE=1; shift ;;
+    --show-secrets)     SHOW_SECRETS=1; shift ;;
+    --reuse)            REUSE=1; shift ;;
     --dry-run)          DRY_RUN=1; shift ;;
     --yes|-y)           ASSUME_YES=1; shift ;;
     --help|-h)          usage ;;
@@ -77,6 +91,28 @@ while [ $# -gt 0 ]; do
 done
 
 cd "$(dirname "$0")"
+
+# --- refuse an unsafe or half-finished setup up front -----------------------
+# Better to fail before creating anything than to leave a deployed bridge and a
+# running consumer attached to a number that answers strangers.
+
+if [ "$INSTALL_CONSUMER" -eq 1 ]; then
+  [ -n "$NUMBER_ID" ] || die "--install-consumer needs --number-id num_xxx.
+     Without it the consumer is installed but no number is in relay mode, which
+     looks finished and answers nothing. Find yours with:
+       curl -s https://api.agentcall.co/v1/numbers -H 'Authorization: Bearer ac_live_...'"
+  if [ ${#ALLOW[@]} -eq 0 ] && [ "$ALLOW_ANYONE" -eq 0 ]; then
+    die "--install-consumer needs --allow +1XXXXXXXXXX (repeatable).
+     That list is what keeps your agent answering only you. Whatever your agent
+     can do, a text from an allowed number can attempt.
+     To deliberately let ANYONE who texts the number reach your agent, pass
+     --allow-anyone instead."
+  fi
+  if [ "$ALLOW_ANYONE" -eq 1 ] && [ ${#ALLOW[@]} -eq 0 ]; then
+    warn "--allow-anyone: ANY phone that texts $NUMBER_ID reaches your agent."
+    warn "Only do this for an agent you are happy to let strangers drive."
+  fi
+fi
 
 # --- prerequisites ----------------------------------------------------------
 
@@ -102,6 +138,40 @@ fi
 if [ ! -d node_modules ]; then
   step "Installing dependencies"
   run npm install
+fi
+
+# --- do not silently take over an existing Worker ---------------------------
+# `wrangler deploy` UPDATES a Worker of the same name, and the secret writes
+# below REPLACE its secrets. On the default name that is easy to do to a bridge
+# someone is already using: their AgentCall numbers keep signing with the old
+# secret and every text starts failing signature verification.
+
+if [ "$DRY_RUN" -eq 0 ] && [ "$REUSE" -eq 0 ]; then
+  step "Checking the Worker name is free"
+  if $WRANGLER deployments list --name "$NAME" >/dev/null 2>&1; then
+    die "a Worker named '$NAME' already exists on this account.
+
+     Deploying over it would replace its secrets, and any AgentCall number
+     pointed at it would start failing signature verification on every text.
+
+     Either pick another name:   --name hermes-bridge-2
+     or deliberately reuse it:   --reuse   (REPLACES its secrets; you will then
+                                            need to re-run configure-number with
+                                            the new signing secret)"
+  fi
+  say "  '$NAME' is free"
+fi
+
+# Anything created from here on is recorded, so a half-finished run can be
+# undone without hunting through the Cloudflare dashboard.
+ROLLBACK_FILE="$(pwd)/.bootstrap-rollback"
+record_rollback() { # record_rollback <human line>
+  [ "$DRY_RUN" -eq 1 ] && return 0
+  printf '%s\n' "$1" >> "$ROLLBACK_FILE"
+}
+if [ "$DRY_RUN" -eq 0 ]; then
+  : > "$ROLLBACK_FILE"
+  record_rollback "# Undo this bootstrap run ($(date -u +%Y-%m-%dT%H:%M:%SZ)), newest first:"
 fi
 
 # --- confirm ----------------------------------------------------------------
@@ -138,6 +208,7 @@ else
      then re-run with the id pasted into wrangler.jsonc."
   fi
   say "  created    id $KV_ID"
+  record_rollback "npx wrangler kv namespace delete --namespace-id $KV_ID   # KV"
 fi
 
 # --- wrangler.jsonc ---------------------------------------------------------
@@ -149,7 +220,11 @@ if [ -f wrangler.jsonc ] && [ "$DRY_RUN" -eq 0 ]; then
 fi
 
 if [ -n "$DOMAIN" ]; then
-  ROUTES=$(printf '  "routes": [\n    { "pattern": "%s/*", "custom_domain": true }\n  ],' "$DOMAIN")
+  # BARE hostname, no "/*". The wildcard form is for Worker Routes; wrangler
+  # rejects it on a Custom Domain, and the config is valid JSON either way, so
+  # only a real deploy surfaces the mistake.
+  DOMAIN="${DOMAIN%/\*}"; DOMAIN="${DOMAIN%/}"
+  ROUTES=$(printf '  "routes": [\n    { "pattern": "%s", "custom_domain": true }\n  ],' "$DOMAIN")
   WORKERS_DEV='  "workers_dev": false,'
 else
   ROUTES=""
@@ -227,6 +302,7 @@ else
   else
     BRIDGE_URL="$(printf '%s' "$DEPLOY_OUT" | grep -oE 'https://[a-zA-Z0-9.-]+\.workers\.dev' | head -1 || true)"
   fi
+  record_rollback "npx wrangler delete --name $NAME   # the Worker itself"
   [ -n "$BRIDGE_URL" ] || die "deployed, but could not find the URL in the output above.
      Find it with 'npx wrangler deployments list' and pass it to the consumer
      installer as --bridge-url."
@@ -254,36 +330,63 @@ fi
 
 step "Bridge is up"
 say "  URL        $BRIDGE_URL"
-say ""
-say "  Keep these. Cloudflare will not show them to you again:"
-say "    AGENTCALL_SIGNING_SECRET=$AGENTCALL_SIGNING_SECRET"
-say "    AGENTCALL_SMS_SIGNING_SECRET=$AGENTCALL_SMS_SIGNING_SECRET"
-say "    HERMES_PUSH_KEY=$HERMES_PUSH_KEY"
+[ "$DRY_RUN" -eq 0 ] && say "  rollback   $ROLLBACK_FILE (commands to undo this run)"
+
+# Secrets go to a 0600 file, not to stdout. Terminal scrollback, CI logs, agent
+# tool output, screen recordings, and pasted support transcripts all capture
+# stdout, and Cloudflare will not show these values again, so they cannot be
+# treated as ephemeral. Written with a restrictive umask rather than
+# chmod-after-write, so the file is never briefly world-readable.
+SECRETS_FILE="$(pwd)/.bootstrap-secrets"
+if [ "$DRY_RUN" -eq 1 ]; then
+  say "  would write $SECRETS_FILE (0600)"
+else
+  ( umask 077; cat > "$SECRETS_FILE" <<EOF
+# AgentCall bridge secrets, generated $(date -u +%Y-%m-%dT%H:%M:%SZ)
+# Cloudflare will not show these again. Keep or delete deliberately.
+AGENTCALL_BRIDGE_URL=$BRIDGE_URL
+AGENTCALL_SIGNING_SECRET=$AGENTCALL_SIGNING_SECRET
+AGENTCALL_SMS_SIGNING_SECRET=$AGENTCALL_SMS_SIGNING_SECRET
+HERMES_PUSH_KEY=$HERMES_PUSH_KEY
+EOF
+  )
+  chmod 600 "$SECRETS_FILE" 2>/dev/null || true
+  say "  secrets    $SECRETS_FILE (0600, not printed)"
+fi
+
+if [ "$SHOW_SECRETS" -eq 1 ]; then
+  warn "--show-secrets: these are now in your scrollback and any log capturing it."
+  say "    AGENTCALL_SIGNING_SECRET=$AGENTCALL_SIGNING_SECRET"
+  say "    AGENTCALL_SMS_SIGNING_SECRET=$AGENTCALL_SMS_SIGNING_SECRET"
+  say "    HERMES_PUSH_KEY=$HERMES_PUSH_KEY"
+fi
 
 if [ "$INSTALL_CONSUMER" -eq 1 ]; then
   step "Installing the consumer"
-  consumer_args=(--bridge-url "$BRIDGE_URL" --bridge-dir "$(pwd)"
-                 --push-key "$HERMES_PUSH_KEY"
-                 --sms-secret "$AGENTCALL_SMS_SIGNING_SECRET")
-  [ -n "$NUMBER_ID" ] && consumer_args+=(--number-id "$NUMBER_ID")
+  # Secrets travel in the ENVIRONMENT, never argv. Command lines are readable
+  # by any user on the box via ps; an environment is readable only by the same
+  # user and root.
+  consumer_args=(--bridge-dir "$(pwd)" --number-id "$NUMBER_ID")
   for a in "${ALLOW[@]:-}"; do [ -n "$a" ] && consumer_args+=(--allow "$a"); done
+  [ "$ALLOW_ANYONE" -eq 1 ] && consumer_args+=(--yes)
   if [ "$DRY_RUN" -eq 1 ]; then
-    printf '  would run: ./consumer/install.sh %s --api-key <prompted>\n' "${consumer_args[*]}"
+    printf '  would run: AGENTCALL_BRIDGE_URL=... HERMES_PUSH_KEY=... \\\n'
+    printf '             AGENTCALL_SMS_SIGNING_SECRET=... ./consumer/install.sh %s\n' "${consumer_args[*]}"
   else
-    ./consumer/install.sh "${consumer_args[@]}"
+    AGENTCALL_BRIDGE_URL="$BRIDGE_URL" \
+    HERMES_PUSH_KEY="$HERMES_PUSH_KEY" \
+    AGENTCALL_SMS_SIGNING_SECRET="$AGENTCALL_SMS_SIGNING_SECRET" \
+      ./consumer/install.sh "${consumer_args[@]}"
   fi
   exit $?
 fi
 
 say ""
-say "  Next, install the consumer next to your agent:"
-say "    ./consumer/install.sh \\"
-say "      --bridge-url $BRIDGE_URL \\"
-say "      --bridge-dir $(pwd) \\"
-say "      --push-key   '$HERMES_PUSH_KEY' \\"
-say "      --sms-secret '$AGENTCALL_SMS_SIGNING_SECRET' \\"
-say "      --api-key    'ac_live_...' \\"
-say "      --number-id  num_xxx \\"
-say "      --allow      +1XXXXXXXXXX"
+say "  Next, install the consumer next to your agent. Load the secrets from the"
+say "  file rather than typing them, so they stay out of your shell history:"
+say ""
+say "    set -a; . $SECRETS_FILE; set +a"
+say "    ./consumer/install.sh --bridge-dir $(pwd) \\"
+say "      --number-id num_xxx --allow +1XXXXXXXXXX"
 say ""
 say "  (or re-run this with --install-consumer to chain them)"

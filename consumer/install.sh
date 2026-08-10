@@ -32,11 +32,14 @@ set -euo pipefail
 
 REPO_RAW="https://raw.githubusercontent.com/Kintupercy/agentcall-hermes-bridge/main/consumer"
 
-BRIDGE_URL=""
+# Seeded from the environment so callers (bootstrap.sh, CI) can pass secrets
+# without putting them in argv, where any user on the box can read them out of
+# `ps`. Flags still win if given.
+BRIDGE_URL="${AGENTCALL_BRIDGE_URL:-}"
 BRIDGE_DIR=""
-PUSH_KEY=""
-API_KEY=""
-SMS_SECRET=""
+PUSH_KEY="${HERMES_PUSH_KEY:-}"
+API_KEY="${AGENTCALL_API_KEY:-}"
+SMS_SECRET="${AGENTCALL_SMS_SIGNING_SECRET:-}"
 BRAIN=""
 NUMBER_ID=""
 VERIFY_LIVE=""

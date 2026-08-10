@@ -15,3 +15,8 @@ consumer/brains/hermes_brain.sh
 consumer/state.json
 __pycache__/
 *.pyc
+
+# bootstrap.sh output: generated secrets, rollback commands, config backup
+.bootstrap-secrets
+.bootstrap-rollback
+wrangler.jsonc.bak
