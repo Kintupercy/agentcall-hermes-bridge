@@ -45,7 +45,30 @@ warn() { printf 'warning: %s\n' "$*" >&2; }
 die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
 
 usage() {
-  sed -n '3,30p' "$0" | sed 's/^# \{0,1\}//'
+  # Piped into bash, "$0" is the shell itself, so reading the header back out of
+  # the file only works when the script is on disk.
+  if [ -f "$0" ] && head -1 "$0" | grep -q '^#!'; then
+    sed -n '3,30p' "$0" | sed 's/^# \{0,1\}//'
+  else
+    cat <<'USAGE'
+One-command install for the AgentCall SMS relay consumer.
+
+  --bridge-url URL    your deployed bridge, https://hermes.example.com
+  --push-key KEY      the bridge's HERMES_PUSH_KEY
+  --api-key KEY       your AgentCall API key, ac_live_...
+  --sms-secret SECRET the bridge's signing secret (enables selftest)
+  --allow +1555...    a phone number allowed to reach your agent (repeatable)
+  --brain PATH        the command that asks your agent for a reply
+  --number-id num_... also put this number into relay mode
+  --prefix DIR        install location
+  --user NAME         run the service as an existing user
+  --no-service        install files only, do not touch systemd
+  --yes               do not prompt for optional values
+
+Run with no arguments to be prompted for each value.
+Docs: https://github.com/Kintupercy/agentcall-hermes-bridge/tree/main/consumer
+USAGE
+  fi
   exit 0
 }
 
@@ -97,11 +120,19 @@ say "  state     $STATE_DIR"
 
 # --- gather settings --------------------------------------------------------
 
+# Can we ask the user something? Test /dev/tty, NOT stdin. Under the documented
+# `curl ... | install.sh | bash` flow stdin is the pipe carrying the script, so
+# `[ -t 0 ]` is false even though there is a perfectly good terminal attached —
+# gating on it made the headline one-liner die with "no terminal to ask on".
+# A real non-interactive context (CI, a container with no controlling terminal)
+# has no readable /dev/tty and still falls through to the error.
+if [ -r /dev/tty ]; then HAVE_TTY=1; else HAVE_TTY=0; fi
+
 prompt() { # prompt VAR_NAME "question" [secret]
   local __var="$1" __q="$2" __secret="${3:-}" __val=""
   eval "__val=\${$__var}"
   [ -n "$__val" ] && return 0
-  [ -t 0 ] || die "$__var not set and no terminal to ask on. Pass it as a flag."
+  [ "$HAVE_TTY" -eq 1 ] || die "$__var not set and no terminal to ask on. Pass it as a flag."
   if [ -n "$__secret" ]; then
     read -r -s -p "$__q: " __val < /dev/tty; printf '\n'
   else
@@ -128,12 +159,12 @@ esac
 prompt PUSH_KEY   "Worker HERMES_PUSH_KEY" secret
 prompt API_KEY    "AgentCall API key (ac_live_...)" secret
 
-if [ -z "$SMS_SECRET" ] && [ -t 0 ] && [ "$ASSUME_YES" -eq 0 ]; then
+if [ -z "$SMS_SECRET" ] && [ "$HAVE_TTY" -eq 1 ] && [ "$ASSUME_YES" -eq 0 ]; then
   read -r -s -p "Worker AGENTCALL_SMS_SIGNING_SECRET (blank to skip; needed for selftest): " SMS_SECRET < /dev/tty
   printf '\n'
 fi
 
-if [ ${#ALLOW[@]} -eq 0 ] && [ -t 0 ] && [ "$ASSUME_YES" -eq 0 ]; then
+if [ ${#ALLOW[@]} -eq 0 ] && [ "$HAVE_TTY" -eq 1 ] && [ "$ASSUME_YES" -eq 0 ]; then
   read -r -p "Your phone number, E.164, so only you can reach the agent (blank = anyone): " _allow < /dev/tty
   [ -n "$_allow" ] && ALLOW+=("$_allow")
 fi
