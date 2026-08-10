@@ -112,7 +112,10 @@ class HttpTransportCase(unittest.TestCase):
         self.assertIn("caller ID", prompt)
 
     def test_full_profile_drops_the_restriction_only_when_asked(self):
-        self.run_brain(payload(), env={"HERMES_PROFILE": "full"})
+        # Both switches, because one alone is refused (see ConfigCase).
+        self.run_brain(payload(), env={"HERMES_PROFILE": "full",
+                                       "HERMES_ALLOW_FULL_SMS": "1"})
+        self.assertIsNotNone(self.srv.last_request)
         self.assertNotIn("untrusted", self.srv.last_request["message"].lower())
 
     def test_agent_error_is_a_failure_so_the_text_is_retried(self):
@@ -284,21 +287,35 @@ class HermesTransportCase(unittest.TestCase):
         self.assertIn("-t", argv)
         allowed = argv[argv.index("-t") + 1]
         for banned in ("terminal", "file", "code_execution", "computer_use",
-                       "messaging", "cronjob"):
+                       "messaging", "cronjob", "delegation", "browser"):
             self.assertNotIn(banned, allowed)
         self.assertIn("web", allowed)
-        self.assertIn("memory", allowed)
+
+    def test_sms_safe_excludes_writable_memory(self):
+        # memory is WRITABLE. Allowing it would let a text talk the agent into
+        # saving or deleting something permanent, on a channel authenticated by
+        # caller ID. Hermes injects existing memory into the prompt anyway, so
+        # the agent still knows what it knows; it just cannot rewrite it here.
+        argv, _, _ = self._argv(self.cfg(profile="sms-safe"))
+        self.assertNotIn("memory", argv[argv.index("-t") + 1])
 
     def test_full_profile_passes_no_toolset_restriction(self):
-        argv, _, _ = self._argv(self.cfg(profile="full"))
+        argv, _, _ = self._argv(self.cfg(profile="full", allow_full_sms="1"))
         self.assertNotIn("-t", argv)
 
     def test_explicit_toolsets_override_the_profile(self):
         argv, _, _ = self._argv(self.cfg(toolsets="web,memory,terminal"))
         self.assertEqual(argv[argv.index("-t") + 1], "web,memory,terminal")
 
-    def test_headless_never_waits_on_a_hook_approval(self):
+    def test_hooks_are_not_auto_approved_by_default(self):
+        # --accept-hooks auto-approves unseen shell hooks from config.yaml.
+        # Passing it by default would hand shell execution to whoever knows the
+        # number.
         argv, _, _ = self._argv(self.cfg())
+        self.assertNotIn("--accept-hooks", argv)
+
+    def test_hooks_can_be_opted_into_explicitly(self):
+        argv, _, _ = self._argv(self.cfg(accept_hooks="1"))
         self.assertIn("--accept-hooks", argv)
 
     def test_transport_is_autodetected_when_a_binary_exists(self):
@@ -341,6 +358,30 @@ class ConfigCase(unittest.TestCase):
 
     def test_sms_safe_is_the_default_profile(self):
         self.assertEqual(hb.Config({}).profile, "sms-safe")
+
+    def test_full_profile_alone_is_refused(self):
+        # One string is too easy to flip while copying someone's config, so
+        # exposing terminal/files/messaging to SMS takes two deliberate switches.
+        problems = hb.Config({"url": "http://x", "profile": "full"}).problems()
+        self.assertTrue(any("HERMES_ALLOW_FULL_SMS" in p for p in problems), problems)
+
+    def test_full_profile_with_both_switches_is_allowed(self):
+        cfg = hb.Config({"url": "http://x", "profile": "full",
+                         "allow_full_sms": "1"})
+        self.assertEqual(cfg.problems(), [])
+
+    def test_refusing_full_means_no_reply_rather_than_a_quiet_downgrade(self):
+        # Silently falling back to sms-safe would leave the operator believing
+        # the full agent was live. Failing means the text is retried and the
+        # log says exactly which switch is missing.
+        os.environ.update({"HERMES_TRANSPORT": "http", "HERMES_URL": "http://127.0.0.1:1/x",
+                           "HERMES_PROFILE": "full"})
+        p = subprocess.run([sys.executable, BRAIN], input=json.dumps(payload()),
+                           capture_output=True, text=True, env=dict(os.environ),
+                           timeout=30)
+        self.assertEqual(p.returncode, hb.EXIT_FAIL)
+        self.assertEqual(p.stdout, "")
+        self.assertIn("HERMES_ALLOW_FULL_SMS", p.stderr)
 
     def test_env_beats_file(self):
         os.environ["HERMES_URL"] = "http://from-env"

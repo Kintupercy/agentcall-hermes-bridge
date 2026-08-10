@@ -64,13 +64,34 @@ auto-bypassed, built for pipes) and adds the parts that matter on a phone:
 | --- | --- |
 | **Thread continuity** | one AgentCall conversation maps to one stable `hermes -c <session>`, so a follow-up text continues the conversation instead of starting cold |
 | **SMS shaping** | tells the agent it is on SMS, then strips markdown and bounds length on the way out. Without this you get 900 characters of headings and asterisks, unreadable on a phone and several segments |
-| **Tool profile** | `sms-safe` (default) passes `-t web,memory,session_search,todo,clarify`, so `terminal`, `file`, `code_execution`, `computer_use`, `messaging`, and `cronjob` are unreachable from a channel authenticated by caller ID. `HERMES_PROFILE=full` opts out |
+| **Tool profile** | `sms-safe` (default) passes `-t web,session_search`, so `terminal`, `file`, `code_execution`, `computer_use`, `messaging`, `cronjob`, and writable `memory` are unreachable from a channel authenticated by caller ID |
+| **Hooks stay unapproved** | `--accept-hooks` is NOT passed. It auto-approves unseen shell hooks from your `config.yaml`, which on a text-driven service is a silent grant of shell execution. `HERMES_ACCEPT_HOOKS=1` opts in |
 | **Time discipline** | finishes inside the consumer's brain budget, because the bridge redelivers after 300s and a slow turn would be answered twice |
 | **Selftest awareness** | the consumer's synthetic probes are answered cheaply and never touch your agent's memory |
 
 The tool profile is enforced by Hermes on the command line, not requested in the
 prompt. That distinction is the whole point: a prompt is a suggestion, `-t` is a
 restriction.
+
+**Why `memory` is excluded even though it looks harmless.** It is writable. A
+text could talk the agent into saving, overwriting, or deleting something
+permanent, and the sender here is authenticated by caller ID alone. Hermes
+injects existing memory into the prompt regardless of the toolset, so your agent
+still *knows* what it knows over SMS; it just cannot rewrite it from a text.
+Route memory writes through a channel you actually authenticate, or queue them
+for review.
+
+**Exposing the full agent takes two switches, not one.**
+
+```bash
+HERMES_PROFILE=full
+HERMES_ALLOW_FULL_SMS=1      # without this the adapter refuses to run
+```
+
+One string is too easy to flip while copying someone's config. Missing the
+second switch is a hard refusal rather than a quiet downgrade: the text is
+retried and the log names the missing setting, so nobody ends up believing the
+full agent is live when it is not.
 
 Not running Hermes? The same adapter speaks three other transports
 (`HERMES_URL` for an HTTP agent, `HERMES_COMMAND` for any CLI, `HERMES_CONTAINER`
@@ -319,7 +340,7 @@ journald, Docker, and support tickets.
 python3 consumer/tests/test_consumer.py
 ```
 
-104 tests, standard library, no network (71 consumer + 33 adapter). They cover the ack decision for every
+109 tests, standard library, no network (71 consumer + 38 adapter). They cover the ack decision for every
 outcome (replied, brain failure, 5xx, 429, opted-out, gone, malformed),
 redelivery after a failed ack including across a restart, the allowlist, the
 brain contract on a real subprocess (stdout, exit 64, non-zero, empty output,
