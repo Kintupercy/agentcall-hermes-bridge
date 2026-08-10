@@ -25,8 +25,10 @@ transport.
   * SMS shaping. The agent is told it is on SMS: short, plain text, no markdown,
     no bullet lists. Without this you get a 900-character answer with headings,
     which is unreadable on a phone and costs multiple segments.
-  * Tool profile. `sms-safe` (default) tells the agent which capabilities are
-    off-limits on a channel authenticated only by caller ID. `full` is opt-in.
+  * Tool profile. `sms-safe` (default) restricts Hermes to read-only toolsets
+    on the command line, on a channel authenticated only by caller ID. Notably
+    it excludes writable `memory`, so a text cannot rewrite what your agent
+    permanently believes. `full` needs two switches, not one.
   * Time discipline. The bridge redelivers an unacked text after 300s, so a
     brain that runs longer makes the agent answer twice. This one refuses to
     exceed its budget and says so rather than hanging.
@@ -44,6 +46,11 @@ Configure with environment variables (or a JSON file at $HERMES_BRAIN_CONFIG):
     HERMES_CONTAINER   docker transport: container name
     HERMES_DOCKER_CMD  docker transport: command inside it (prompt on stdin)
     HERMES_PROFILE     sms-safe | full                (default: sms-safe)
+    HERMES_ALLOW_FULL_SMS=1  required IN ADDITION to profile=full; two switches
+                       because one is too easy to flip while copying a config
+    HERMES_ACCEPT_HOOKS=1    opt in to auto-approving unseen shell hooks. Off by
+                       default: it grants shell execution to whoever knows the
+                       number
     HERMES_TIMEOUT     seconds, must stay under the consumer's brain timeout
     HERMES_SESSION_PREFIX  prefix for derived session ids (default: agentcall)
 
@@ -86,13 +93,25 @@ DISCOVERY_PORTS = (8080, 3000, 8000, 5000, 11434)
 DISCOVERY_PATHS = ("/health", "/healthz", "/v1/health", "/")
 
 
-# Hermes toolsets the sms-safe profile allows. Read, look up, remember, ask a
-# clarifying question. Deliberately excluded, because a channel authenticated
-# by caller ID should not reach them: terminal, file, code_execution,
-# computer_use, browser (can act, not just read), messaging (can send as you),
-# cronjob (schedules future action), delegation, and the paid generators
-# image_gen / tts / video_gen. Override with HERMES_TOOLSETS if your set differs.
-SMS_SAFE_TOOLSETS = "web,memory,session_search,todo,clarify"
+# Hermes toolsets the sms-safe profile allows: look things up, read past
+# sessions, answer. Nothing here can change durable state.
+#
+# `memory` is deliberately NOT in this list even though it is tempting. It is
+# WRITABLE: a text could talk the agent into saving, overwriting, or deleting
+# something permanent, and on this channel the sender is authenticated by
+# caller ID alone. Hermes injects existing memory into the prompt regardless of
+# the toolset, so the agent still *knows* what it knows over SMS; it just
+# cannot rewrite it from a text message. Route memory writes through a channel
+# you actually authenticate.
+#
+# Also excluded: terminal, file, code_execution, computer_use, browser (acts,
+# not just reads), messaging (sends as you), cronjob (schedules future action),
+# delegation, and the paid generators image_gen / tts / video_gen.
+#
+# `todo` and `clarify` are left out as unnecessary rather than dangerous: an
+# SMS turn is two sentences, and the agent can simply ask its question in the
+# reply. Add them back with HERMES_TOOLSETS if you want them.
+SMS_SAFE_TOOLSETS = "web,session_search"
 
 
 def _find_hermes() -> str:
@@ -144,6 +163,15 @@ class Config:
         self.container: str = pick("container", "HERMES_CONTAINER", "")
         self.docker_cmd: str = pick("docker_cmd", "HERMES_DOCKER_CMD", "")
         self.profile: str = pick("profile", "HERMES_PROFILE", "sms-safe")
+        # Two independent switches to expose the full agent to SMS. One string
+        # is too easy to flip while copying someone's config; this one has to
+        # be meant. See problems().
+        self.allow_full_sms: bool = str(
+            pick("allow_full_sms", "HERMES_ALLOW_FULL_SMS", "")
+        ).strip().lower() in ("1", "true", "yes")
+        self.accept_hooks: bool = str(
+            pick("accept_hooks", "HERMES_ACCEPT_HOOKS", "")
+        ).strip().lower() in ("1", "true", "yes")
         self.timeout: float = float(pick("timeout", "HERMES_TIMEOUT", DEFAULT_TIMEOUT))
         self.session_prefix: str = pick("session_prefix", "HERMES_SESSION_PREFIX",
                                         "agentcall")
@@ -193,6 +221,15 @@ class Config:
             out.append("HERMES_TRANSPORT=docker needs HERMES_CONTAINER")
         if self.profile not in ("sms-safe", "full"):
             out.append("HERMES_PROFILE must be 'sms-safe' or 'full'")
+        if self.profile == "full" and not self.allow_full_sms:
+            out.append(
+                "HERMES_PROFILE=full exposes your whole agent to text messages: "
+                "terminal, files, messaging, cron, MCP tools, everything it can "
+                "normally do, driven by a channel authenticated only by caller "
+                "ID. That needs a second, deliberate switch. Set "
+                "HERMES_ALLOW_FULL_SMS=1 as well if you genuinely mean it, or "
+                "drop back to HERMES_PROFILE=sms-safe."
+            )
         return out
 
 
@@ -357,7 +394,12 @@ def _run(argv: List[str], prompt: str, deadline: float) -> Tuple[str, Optional[s
         return "", (f"the agent did not answer within {budget:.0f}s. The bridge "
                     f"redelivers an unanswered text, so a slow agent gets asked "
                     f"twice: shorten the turn or raise HERMES_TIMEOUT and the "
-                    f"consumer's brain.timeout_seconds together.")
+                    f"consumer's brain.timeout_seconds together. If this is "
+                    f"instant rather than slow, the agent may be waiting on a "
+                    f"shell-hook approval that no terminal can answer: review "
+                    f"the hooks in your config.yaml, approve them once "
+                    f"interactively, and only then consider "
+                    f"HERMES_ACCEPT_HOOKS=1.")
     except FileNotFoundError:
         return "", f"command not found: {argv[0]}"
     except Exception as exc:
@@ -401,8 +443,13 @@ def ask_hermes(cfg: Config, prompt: str, session: str, deadline: float) -> Tuple
         argv += ["-t", toolsets]
     if cfg.hermes_model:
         argv += ["-m", cfg.hermes_model]
-    # Headless: never wait on a hook approval there is no terminal to answer.
-    argv.append("--accept-hooks")
+    # NOT passed by default: --accept-hooks auto-approves any unseen shell hook
+    # declared in the user's config.yaml. On a headless service driven by text
+    # messages that is a silent grant of shell execution to whoever knows the
+    # number. If an unapproved hook blocks the run, the honest outcome is this
+    # turn failing and saying so, not the adapter waving it through.
+    if cfg.accept_hooks:
+        argv.append("--accept-hooks")
     return _run(argv, "", deadline)
 
 
