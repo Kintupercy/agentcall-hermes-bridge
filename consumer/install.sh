@@ -28,6 +28,7 @@ set -euo pipefail
 REPO_RAW="https://raw.githubusercontent.com/Kintupercy/agentcall-hermes-bridge/main/consumer"
 
 BRIDGE_URL=""
+BRIDGE_DIR=""
 PUSH_KEY=""
 API_KEY=""
 SMS_SECRET=""
@@ -75,6 +76,7 @@ USAGE
 while [ $# -gt 0 ]; do
   case "$1" in
     --bridge-url) BRIDGE_URL="${2:-}"; shift 2 ;;
+    --bridge-dir) BRIDGE_DIR="${2:-}"; shift 2 ;;
     --push-key)   PUSH_KEY="${2:-}"; shift 2 ;;
     --api-key)    API_KEY="${2:-}"; shift 2 ;;
     --sms-secret) SMS_SECRET="${2:-}"; shift 2 ;;
@@ -159,9 +161,32 @@ esac
 prompt PUSH_KEY   "Worker HERMES_PUSH_KEY" secret
 prompt API_KEY    "AgentCall API key (ac_live_...)" secret
 
+# The SMS signing secret is NOT optional, because the failure it causes is
+# invisible. One value has to live in two places: the Worker, and the AgentCall
+# number. If they differ, AgentCall accepts the text, signs it with its copy,
+# and the Worker rejects the push with 401 — the text just vanishes, while both
+# sides look configured. Reading the number back does not help: AgentCall
+# redacts the stored secret to `hasSigningSecret: true`, which proves a secret
+# exists and nothing about which one.
+#
+# So: collect it, or generate it, and then push the SAME value to both sides.
 if [ -z "$SMS_SECRET" ] && [ "$HAVE_TTY" -eq 1 ] && [ "$ASSUME_YES" -eq 0 ]; then
-  read -r -s -p "Worker AGENTCALL_SMS_SIGNING_SECRET (blank to skip; needed for selftest): " SMS_SECRET < /dev/tty
+  say ""
+  say "  The SMS signing secret must be identical in your Worker and on your"
+  say "  AgentCall number. Paste the Worker's AGENTCALL_SMS_SIGNING_SECRET, or"
+  say "  leave it blank and one will be generated for you to install in both."
+  read -r -s -p "Worker AGENTCALL_SMS_SIGNING_SECRET (blank = generate): " SMS_SECRET < /dev/tty
   printf '\n'
+fi
+GENERATED_SECRET=0
+if [ -z "$SMS_SECRET" ]; then
+  if command -v openssl >/dev/null 2>&1; then
+    SMS_SECRET="$(openssl rand -hex 32)"
+  else
+    SMS_SECRET="$("$PYTHON" -c 'import secrets; print(secrets.token_hex(32))')"
+  fi
+  GENERATED_SECRET=1
+  say "  generated a new SMS signing secret"
 fi
 
 if [ ${#ALLOW[@]} -eq 0 ] && [ "$HAVE_TTY" -eq 1 ] && [ "$ASSUME_YES" -eq 0 ]; then
@@ -339,6 +364,38 @@ fi
 
 # --- verify -----------------------------------------------------------------
 
+# --- put the SAME secret on the Worker --------------------------------------
+
+step "Worker secret"
+SECRET_WAIT=0
+if [ -n "$BRIDGE_DIR" ] && command -v wrangler >/dev/null 2>&1; then
+  if printf '%s' "$SMS_SECRET" | (cd "$BRIDGE_DIR" && wrangler secret put AGENTCALL_SMS_SIGNING_SECRET >/dev/null 2>&1); then
+    say "  wrote AGENTCALL_SMS_SIGNING_SECRET to the Worker in $BRIDGE_DIR"
+    SECRET_WAIT=45   # let it reach every edge before selftest calls a 401 a mismatch
+  else
+    warn "could not write the Worker secret automatically. Do it by hand (below)."
+  fi
+fi
+if [ "$SECRET_WAIT" -eq 0 ]; then
+  say "  Not written automatically. In your bridge repo, run:"
+  say ""
+  say "    wrangler secret put AGENTCALL_SMS_SIGNING_SECRET"
+  if [ "$GENERATED_SECRET" -eq 1 ]; then
+    say "    # paste this exact value:"
+    say "    $SMS_SECRET"
+  else
+    say "    # paste the same value you gave this installer"
+  fi
+  say ""
+  say "  (pass --bridge-dir /path/to/agentcall-hermes-bridge to have this done for you)"
+  if [ "$HAVE_TTY" -eq 1 ] && [ "$ASSUME_YES" -eq 0 ]; then
+    read -r -p "  Press enter once the Worker secret is set... " _ < /dev/tty
+    SECRET_WAIT=15
+  fi
+fi
+
+# --- verify ------------------------------------------------------------------
+
 step "Preflight"
 set -a
 # shellcheck disable=SC1090
@@ -351,10 +408,22 @@ $RUN_CMD preflight || PREFLIGHT_RC=$?
 
 if [ -n "$NUMBER_ID" ]; then
   step "Configuring $NUMBER_ID for relay"
-  configure_args=(configure-number --number-id "$NUMBER_ID" --bridge-url "$BRIDGE_URL")
-  [ -n "$SMS_SECRET" ] && configure_args+=(--signing-secret "$SMS_SECRET")
+  # Always pass the secret, never let AgentCall keep a stored one. On an
+  # existing number the stored secret is usually the stale half of this exact
+  # problem, and nothing can read it back to tell you.
+  configure_args=(configure-number --number-id "$NUMBER_ID" --bridge-url "$BRIDGE_URL" --signing-secret "$SMS_SECRET")
   for a in "${ALLOW[@]:-}"; do [ -n "$a" ] && configure_args+=(--allow "$a"); done
   $RUN_CMD "${configure_args[@]}" || warn "could not configure the number; run it by hand (see below)."
+fi
+
+# --- prove it, do not assume it ---------------------------------------------
+
+SELFTEST_RC=0
+if [ -n "$NUMBER_ID" ] && [ "$PREFLIGHT_RC" -eq 0 ]; then
+  step "Selftest (signed synthetic text through the real loop; texts nobody)"
+  $RUN_CMD selftest --secret-wait "$SECRET_WAIT" || SELFTEST_RC=$?
+else
+  SELFTEST_RC=127
 fi
 
 # --- what next --------------------------------------------------------------
@@ -368,12 +437,29 @@ if [ -z "$NUMBER_ID" ]; then
   say ""
   say "  The number is not in relay mode yet. When you are ready:"
   say "    $RUN_CMD configure-number --number-id num_xxx \\"
-  say "      --bridge-url $BRIDGE_URL --signing-secret <worker sms secret> \\"
+  say "      --bridge-url $BRIDGE_URL --signing-secret <the same secret> \\"
   say "      --allow +1XXXXXXXXXX"
+  say "    $RUN_CMD selftest"
 fi
 say ""
+
 if [ "$PREFLIGHT_RC" -ne 0 ]; then
-  say "Installed, but preflight found problems (above). Fix those before testing."
+  say "NOT READY. Preflight found problems (above). Fix those, then re-run preflight."
   exit "$PREFLIGHT_RC"
 fi
-say "Installed and running."
+if [ "$SELFTEST_RC" -eq 127 ]; then
+  say "Installed. NOT verified end to end yet: configure a number, then run selftest."
+  say "Do not trust the setup until selftest passes."
+  exit 0
+fi
+if [ "$SELFTEST_RC" -ne 0 ]; then
+  say "NOT READY. Installed and configured, but the selftest did not pass, so a"
+  say "real text would be dropped somewhere in the chain. The most common cause is"
+  say "the Worker and the number holding DIFFERENT signing secrets. Fix that, then:"
+  say "    $RUN_CMD selftest"
+  exit "$SELFTEST_RC"
+fi
+
+say "Ready. The loop is proven end to end except for the carrier."
+say "Now send a real text to your number, then run:"
+say "    $RUN_CMD verify --number +1XXXXXXXXXX"

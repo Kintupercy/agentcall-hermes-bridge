@@ -464,6 +464,91 @@ class TestPolling(ConsumerTestCase):
         self.assertTrue(c.USER_AGENT.startswith("agentcall-sms-consumer/"))
 
 
+class TestStaleSigningSecret(ConsumerTestCase):
+    """The migration failure: a number that already had a relay webhook kept a
+    signing secret from an older bridge. AgentCall accepted the text, signed it
+    with the stale key, and the Worker rejected the push 401. Both sides looked
+    configured; the text just vanished.
+
+    The read cannot tell you: AgentCall redacts the stored secret to
+    `hasSigningSecret: true`, which proves a secret exists and nothing about
+    which one."""
+
+    def _args(self, **over: Any) -> Any:
+        base = dict(number_id="num_1", bridge_url="https://hermes.example.com",
+                    signing_secret="", allow=[], allow_anyone=False,
+                    system_prompt="", dry_run=True, keep_secret=False)
+        base.update(over)
+        return type("A", (), base)()
+
+    def _existing(self) -> str:
+        # What the API returns for a number already pointed at this bridge.
+        return json.dumps({"numberId": "num_1", "number": "+15559998888", "config": {
+            "mode": "ai", "systemPrompt": "answers calls",
+            "agentWebhook": {"url": "https://hermes.example.com/agentcall/sms",
+                             "hasSigningSecret": True},
+        }})
+
+    def test_never_silently_preserves_the_stored_secret(self) -> None:
+        # The old behaviour: an existing webhook on the same URL meant the
+        # secret was omitted, so the server kept the stale one.
+        cfg = make_config(self.tmp)
+        self.http.on("/inbound-config", 200, self._existing())
+        rc = c.cmd_configure_number(cfg, self._args())
+        self.assertEqual(rc, 2)  # refuses rather than preserving
+
+    def test_writes_the_secret_when_given_one(self) -> None:
+        cfg = make_config(self.tmp)
+        self.http.on("/inbound-config", 200, self._existing())
+        rc = c.cmd_configure_number(cfg, self._args(signing_secret="s" * 20))
+        self.assertEqual(rc, 0)
+
+    def test_falls_back_to_the_configured_secret(self) -> None:
+        # The installer puts it in the env, so configure-number should use it
+        # rather than making the user paste it twice.
+        cfg = make_config(self.tmp, agentcall_sms_signing_secret="from-config-1234567")
+        self.http.on("/inbound-config", 200, self._existing())
+        rc = c.cmd_configure_number(cfg, self._args())
+        self.assertEqual(rc, 0)
+
+    def test_keep_secret_is_an_explicit_opt_in(self) -> None:
+        cfg = make_config(self.tmp)
+        self.http.on("/inbound-config", 200, self._existing())
+        rc = c.cmd_configure_number(cfg, self._args(keep_secret=True))
+        self.assertEqual(rc, 0)
+
+
+class TestSignatureProbe(ConsumerTestCase):
+    def test_401_means_the_secret_does_not_match_the_worker(self) -> None:
+        bridge = c.Bridge(make_config(self.tmp))
+        self.http.on("/agentcall/sms", 401, '{"error":"invalid_signature"}')
+        ok, detail = bridge.probe_signature("wrong-secret-1234567")
+        self.assertFalse(ok)
+        self.assertIn("not the Worker", detail)
+
+    def test_200_means_it_matches(self) -> None:
+        bridge = c.Bridge(make_config(self.tmp))
+        self.http.on("/agentcall/sms", 200, '{"status":"queued"}')
+        ok, _ = bridge.probe_signature("right-secret-1234567")
+        self.assertTrue(ok)
+
+    def test_probe_acks_itself_so_the_consumer_never_sees_it(self) -> None:
+        bridge = c.Bridge(make_config(self.tmp))
+        self.http.on("/agentcall/sms", 200, '{"status":"queued"}')
+        self.http.on("/hermes/ack-sms", 200, '{"status":"ok","removed":1}')
+        bridge.probe_signature("right-secret-1234567")
+        acks = [x for x in self.http.calls if "/ack-sms" in x["url"]]
+        self.assertEqual(len(acks), 1)
+        self.assertTrue(acks[0]["body"]["messageIds"][0].startswith("msg_sigprobe_"))
+
+    def test_probe_uses_a_selftest_conversation_so_it_can_never_text_anyone(self) -> None:
+        bridge = c.Bridge(make_config(self.tmp))
+        self.http.on("/agentcall/sms", 200, "{}")
+        bridge.probe_signature("s" * 20)
+        pushed = [x for x in self.http.calls if x["url"].endswith("/agentcall/sms")][0]
+        self.assertTrue(c.is_selftest(pushed["body"]["conversation"]["id"]))
+
+
 class TestBridgeProbe(ConsumerTestCase):
     def test_auth_probe_never_claims_queued_texts(self) -> None:
         # preflight must not use pull-sms: a pull hides every queued text for

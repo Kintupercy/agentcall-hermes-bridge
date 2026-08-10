@@ -151,6 +151,50 @@ consumer holds up its end:
 The restart-safety follows from that, which is why the service can be
 `Restart=always` with no burst limit.
 
+## The one secret that has to match in two places
+
+`AGENTCALL_SMS_SIGNING_SECRET` lives in **two** places, and they must be the
+same value:
+
+1. your Cloudflare Worker (`wrangler secret put`)
+2. your AgentCall number's `agentWebhook.signingSecret`
+
+If they differ, **the text silently disappears**. AgentCall accepts it, signs
+the push with its copy, and the Worker rejects the signature with 401. Both
+sides look configured. Nothing errors anywhere you would think to look.
+
+**You cannot check this by reading the number.** AgentCall redacts the stored
+secret to `hasSigningSecret: true`, which proves *a* secret exists and tells
+you nothing about *which* one. Treating that boolean as proof is the trap.
+
+So the tooling never trusts it:
+
+- `configure-number` **always writes** the secret. Omitting it would make
+  AgentCall keep the stored one, which on an existing number is usually the
+  stale half of this exact problem. `--keep-secret` opts out explicitly and
+  says loudly that nothing has verified it.
+- `preflight` runs a **signature probe**: it signs a throwaway envelope, pushes
+  it, and acks it straight back out of the queue. A 401 there means the secrets
+  differ, and it costs nothing and touches no real thread.
+- `install.sh` generates the secret if you do not supply one, offers to write
+  it to the Worker for you (`--bridge-dir`), and **refuses to print "Ready"
+  until `selftest` passes**.
+
+### Migrating a number that already had a relay webhook
+
+This is where it bites. Always pass the secret explicitly:
+
+```bash
+$C configure-number --number-id num_xxx \
+  --bridge-url https://hermes.your-domain.com \
+  --signing-secret "$AGENTCALL_SMS_SIGNING_SECRET"     # NOT optional
+$C selftest                                             # must pass before you trust it
+```
+
+If you just rotated the Worker secret, add `--secret-wait 45` to `selftest` so
+a 401 during Cloudflare propagation is retried rather than reported as a
+mismatch.
+
 ## Threat model
 
 > **You are about to give a phone number the ability to type into your agent.**
@@ -245,7 +289,7 @@ journald, Docker, and support tickets.
 python3 consumer/tests/test_consumer.py
 ```
 
-63 tests, standard library, no network. They cover the ack decision for every
+71 tests, standard library, no network. They cover the ack decision for every
 outcome (replied, brain failure, 5xx, 429, opted-out, gone, malformed),
 redelivery after a failed ack including across a restart, the allowlist, the
 brain contract on a real subprocess (stdout, exit 64, non-zero, empty output,

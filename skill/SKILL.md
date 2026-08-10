@@ -122,6 +122,21 @@ service otherwise, and runs preflight at the end. Docker instead:
 Do not pass `--number-id` on the first run. Configure the number as a separate,
 explicit step once preflight is clean — it changes how real texts are handled.
 
+### 3.5 The failure that will otherwise bite you
+
+`AGENTCALL_SMS_SIGNING_SECRET` must be the **same value** in the Worker and on
+the AgentCall number. If it is not, the text disappears silently: AgentCall
+accepts it, signs with its copy, the Worker 401s the push, and nothing errors
+anywhere the user would look.
+
+**Never treat `hasSigningSecret: true` as proof.** It means a secret exists, not
+that it is the right one. On a number that was already pointed at an older
+bridge, it is usually the stale half of this exact problem.
+
+So: always pass `--signing-secret` explicitly (step 4 does), and always run
+`selftest` before telling the user it works. A 401 on the selftest push means
+the two secrets differ.
+
 ### 4. Put the number into relay mode
 
 ```bash
@@ -166,7 +181,7 @@ Check in this order. Most reports are one of the first three.
 | Nothing arrives, account is Pro | Number is not in relay mode | step 4 |
 | Nothing arrives, config looks right | Sender is not on the allowlist | add it, or clear it with `--allow-anyone` |
 | `preflight` bridge push key FAIL | `HERMES_PUSH_KEY` differs between the Worker and the consumer | `wrangler secret put` again and update `consumer.env` |
-| `selftest` push FAIL 401 | The signing secret differs between the Worker and the number's `agentWebhook` | re-run step 4 with the right secret |
+| `selftest` push FAIL 401 | The signing secret differs between the Worker and the number's `agentWebhook`. Most common on a MIGRATED number, whose stored secret predates the current Worker | write the same value to both: `wrangler secret put AGENTCALL_SMS_SIGNING_SECRET`, then re-run step 4 with `--signing-secret <that value>`. If you just rotated it, add `--secret-wait 45` for propagation |
 | `selftest` credentials FAIL | Bad or revoked AgentCall API key | new key, update `consumer.env`, restart |
 | Text arrives, no reply | The brain | `journalctl -u agentcall-sms-consumer -f` and look for `brain_error` |
 | Replies stop after a while | Service died, or a user-scope service died at logout | `status`, then `loginctl enable-linger` |
