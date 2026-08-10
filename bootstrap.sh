@@ -229,25 +229,63 @@ if [ "$DRY_RUN" -eq 1 ]; then
   say "  would run: $WRANGLER kv namespace create HERMES_CONTEXT"
   KV_ID="DRY_RUN_KV_ID"
 else
+  # KV namespace TITLES are account-global, so a bare "HERMES_CONTEXT" collides
+  # with any bridge already bootstrapped on this account. Title it per worker.
+  # The runtime binding is still HERMES_CONTEXT: that is set in the config
+  # below and is independent of the namespace's title.
+  #
   # No --config here: the config does not exist yet, and it would reference the
   # very namespace this call is creating.
-  KV_OUT="$($WRANGLER kv namespace create HERMES_CONTEXT 2>&1 || true)"
+  KV_TITLE="${NAME}-HERMES_CONTEXT"
+  KV_OUT="$($WRANGLER kv namespace create "$KV_TITLE" 2>&1 || true)"
   # wrangler has changed this output repeatedly (toml block, jsonc block,
   # quoted vs bare). A 32-hex id is the stable part, so take that.
   KV_ID="$(printf '%s' "$KV_OUT" | grep -oE '[0-9a-f]{32}' | head -1 || true)"
+
+  if [ -z "$KV_ID" ] && printf '%s' "$KV_OUT" | grep -q "already exists"; then
+    # Left over from an earlier run of this same worker name that failed after
+    # creating the namespace. Adopt it rather than making the operator clean up
+    # by hand; the title is worker-scoped, so it cannot be someone else's.
+    say "  '$KV_TITLE' already exists, looking it up"
+    # Parsed with node rather than grep: the list is pretty-printed JSON, and
+    # a regex across it would match the wrong record the moment two titles
+    # share a prefix.
+    KV_ID="$($WRANGLER kv namespace list 2>/dev/null | node -e '
+      let s = "";
+      process.stdin.on("data", d => s += d).on("end", () => {
+        try {
+          const hit = JSON.parse(s.slice(s.indexOf("[")))
+            .find(n => n.title === process.argv[1]);
+          if (hit) process.stdout.write(hit.id);
+        } catch {}
+      });' "$KV_TITLE" || true)"
+    if [ -n "$KV_ID" ]; then
+      say "  reusing    id $KV_ID (not created by this run, so no delete step)"
+      ADOPTED_KV=1
+    fi
+  fi
+
   if [ -z "$KV_ID" ]; then
     say "$KV_OUT"
-    die "could not find a namespace id in the wrangler output above."
+    die "could not create or find the KV namespace '$KV_TITLE'.
+     List what exists with: npx wrangler kv namespace list"
   fi
-  say "  created    id $KV_ID"
-  record_rollback "npx wrangler kv namespace delete --namespace-id $KV_ID"
+  if [ "${ADOPTED_KV:-0}" -eq 0 ]; then
+    say "  created    id $KV_ID  (title $KV_TITLE)"
+    # -y, not --force: kv namespace delete spells its non-interactive flag
+    # --skip-confirmation, and would otherwise sit waiting for a prompt.
+    record_rollback "npx wrangler kv namespace delete --namespace-id $KV_ID -y"
+  fi
 fi
 
 # --- config -----------------------------------------------------------------
 # Written into the per-run directory and passed with --config, so the repo's
 # own wrangler.jsonc is never rewritten and two clients never share one file.
-# `main` is ABSOLUTE because wrangler resolves it relative to the CONFIG file,
-# not the working directory, and the config no longer sits at the repo root.
+# `main` is relative to the CONFIG file, not the working directory, and the
+# config sits at .bootstrap/<account>/<worker>/ — exactly three levels below
+# the repo root, so "../../../src/index.ts" is deterministic. An absolute path
+# looks safer and is not: on Windows/Git-Bash $(pwd) yields "/c/Users/..."
+# which wrangler resolves into nonsense.
 
 step "Config"
 if [ -n "$DOMAIN" ]; then
@@ -265,7 +303,7 @@ fi
 CONFIG_JSON=$(cat <<EOF
 {
   "name": "$NAME",
-  "main": "$REPO_DIR/src/index.ts",
+  "main": "../../../src/index.ts",
   "compatibility_date": "2025-05-05",
   "compatibility_flags": ["nodejs_compat"],
 $WORKERS_DEV
@@ -362,6 +400,17 @@ HERMES_PUSH_KEY=$HERMES_PUSH_KEY
 EOF
   )
   chmod 600 "$SECRETS_FILE" 2>/dev/null || true
+  # Verify rather than assume. chmod and umask are silently ignored on some
+  # filesystems (notably NTFS via Git Bash and some network mounts), and a
+  # world-readable file full of unrecoverable secrets should say so out loud
+  # instead of looking locked down.
+  PERM="$(stat -c '%a' "$SECRETS_FILE" 2>/dev/null || stat -f '%Lp' "$SECRETS_FILE" 2>/dev/null || echo '')"
+  case "$PERM" in
+    600|"") ;;
+    *) warn "$SECRETS_FILE is mode $PERM, not 600. This filesystem ignored chmod."
+       warn "Anyone with access to this machine can read the bridge secrets."
+       warn "Move it somewhere you can actually restrict before leaving it there." ;;
+  esac
 
   # Rollback runs in REVERSE creation order: the Worker goes first, then the
   # KV namespace it was bound to. Tearing the namespace out from under a live
