@@ -7,3 +7,11 @@ dist/
 .env
 .env.local
 .dev.vars
+consumer/consumer.env
+consumer/config.json
+consumer/brains/hermes_brain.sh
+
+# Consumer runtime state (counters + the replied-message set)
+consumer/state.json
+__pycache__/
+*.pyc

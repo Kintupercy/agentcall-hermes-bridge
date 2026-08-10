@@ -1,17 +1,21 @@
 # agentcall-hermes-bridge
 
-A small Cloudflare Worker that closes the loop between AgentCall phone numbers and your AI agent. Pre-call: serves today's brief so the AI answers with fresh context. Post-call: queues the transcript so your agent can absorb what was decided on the call.
+Two pieces that close the loop between AgentCall phone numbers and your AI agent:
 
-Drop-in template. Deploy on your own Cloudflare account, point your AgentCall number's `contextWebhook` at it, register a `call.transcript` webhook for the transcript queue, and have your agent (Hermes, or any agent platform you run) push briefs in and pull transcripts out on a schedule.
+- **`src/`** — a small Cloudflare Worker. The always-on public endpoint AgentCall can hit: serves today's brief on inbound calls, queues transcripts after them, queues inbound texts for the relay.
+- **`consumer/`** — a standard-library Python service that runs next to your agent, drains the SMS queue, asks your agent what to say, and sends the reply in-thread. One command to install, systemd or Docker to keep it up. See **[consumer/README.md](consumer/README.md)**.
+
+Deploy the Worker on your own Cloudflare account, point your AgentCall number at it, install the consumer beside your agent, and texting the number reaches **your** agent — memory, tools, and all.
 
 Walkthroughs with screenshots and Telegram-prompt examples:
 
 - Pre-call context: **https://agentcall.co/docs/hermes**
 - Post-call transcripts: **https://agentcall.co/docs/post-call-webhook**
+- Two-way SMS: **https://agentcall.co/docs/agent-sms**
 
 ## What it does
 
-Ten endpoints, one always-on Cloudflare KV store:
+Eleven endpoints, one always-on Cloudflare KV store:
 
 ### Pre-call (brief in)
 - `POST /hermes/push` — your agent platform hits this whenever a new brief is ready. Auth via `X-Hermes-Push-Key` header. Stores the brief in KV (latest wins, 5000-char cap).
@@ -23,7 +27,7 @@ Ten endpoints, one always-on Cloudflare KV store:
 
 ### Two-way SMS relay (text in, reply out)
 - `POST /agentcall/sms` — with a number in `smsMode: "relay"`, AgentCall hits this on every inbound text. Verifies an HMAC signature (against `AGENTCALL_SMS_SIGNING_SECRET`, falling back to `AGENTCALL_SIGNING_SECRET`), dedups on message id, and appends the relay envelope to a bounded per-agent FIFO queue in KV (max 200). Lets your own agent — not AgentCall's managed AI — answer texts.
-- `POST /hermes/pull-sms` — your agent platform polls this to **claim** inbound texts (at-least-once delivery). Same `X-Hermes-Push-Key` auth. Unlike the transcript pull, it does **not** delete on read: each returned text is hidden for a visibility window (default 120s) instead, so a canceled pull or a crashed/restarted consumer never loses a text. For each entry, reply via AgentCall `POST /v1/sms-conversations/:id/reply`, then ack it.
+- `POST /hermes/pull-sms` — your agent platform polls this to **claim** inbound texts (at-least-once delivery). Same `X-Hermes-Push-Key` auth. Unlike the transcript pull, it does **not** delete on read: each returned text is hidden for a visibility window (300s) instead, so a canceled pull or a crashed/restarted consumer never loses a text. For each entry, reply via AgentCall `POST /v1/sms-conversations/:id/reply`, then ack it. `consumer/` implements this half for you.
 - `POST /hermes/ack-sms` — after you've replied to (or decided to drop) a text, ack it so it's removed for good. Body `{ "messageIds": ["..."] }`. Idempotent. If you never ack (crash/error), the claim expires and the text is redelivered on the next pull. Replies are idempotent on the message id, so redelivery can't double-text.
 
 ### Action bridge (the agent's hands)
@@ -95,6 +99,124 @@ In the AgentCall dashboard (or via the `configure_inbound_ai` MCP tool from your
 
 Then call the number. The AI should answer with the test context loaded. Full walkthrough at [agentcall.co/docs/hermes](https://agentcall.co/docs/hermes).
 
+## Connect my number to Hermes (two-way SMS)
+
+The end state: you text a number, **your** agent answers, in thread, with its
+memory and tools. Not a hosted persona reading a prompt.
+
+First, make sure that is what you want. There are two SMS products and picking
+the wrong one wastes an hour:
+
+| You want | Set | Bridge + consumer? |
+| --- | --- | --- |
+| An assistant that answers texts from a prompt you write | `smsMode: "ai"` with `smsSystemPrompt` | No. AgentCall runs the whole thing. |
+| Texts to reach **your** agent, with its memory and actions | `smsMode: "relay"` | Yes. This is what follows. |
+
+Relay is processed on the Pro plan. On Free the text arrives and is dropped.
+
+> **Read this before you wire it to a powerful agent.**
+>
+> You are giving a phone number the ability to type into your agent. Whatever
+> that agent can do, a text message can now attempt — including shell commands,
+> spending money, and reading your files, if those are on the table. There is no
+> sandbox between the message and the agent; that is the feature.
+>
+> The sender allowlist is a speed bump, not a wall: caller ID is a claim, not a
+> credential. If your agent can execute code or take irreversible actions, put a
+> narrower agent on the SMS channel instead of your full one.
+>
+> Full threat model: [consumer/README.md](consumer/README.md#threat-model).
+
+### 1. Deploy the bridge
+
+The [Quick start](#quick-start) above. The SMS endpoints are already in the
+Worker, so if you already run this bridge for pre-call context, skip ahead.
+
+Keep both secrets: `AGENTCALL_SIGNING_SECRET` (AgentCall signs with it) and
+`HERMES_PUSH_KEY` (the consumer authenticates with it). Neither is recoverable
+after `wrangler secret put`.
+
+### 2. Write the brain
+
+Copy `consumer/brains/hermes_brain.sh.example` to `hermes_brain.sh` and replace
+the one marked block with however you invoke your agent. It reads the text on
+stdin as JSON and prints the reply on stdout. Exit `64` to deliberately say
+nothing; any non-zero exit means the text is redelivered and retried.
+
+`consumer/brains/echo_brain.sh` replies `Echo: <your text>` if you want to prove
+the plumbing before your agent is wired in.
+
+### 3. Install the consumer
+
+```bash
+./consumer/install.sh \
+  --bridge-url https://hermes.your-domain.com \
+  --push-key   "$HERMES_PUSH_KEY" \
+  --api-key    "$AGENTCALL_API_KEY" \
+  --sms-secret "$AGENTCALL_SIGNING_SECRET" \
+  --allow      +15551234567 \
+  --brain      /opt/agentcall-sms-consumer/brains/hermes_brain.sh
+```
+
+Installs the service, writes a 0600 secrets file, enables systemd, and runs
+preflight. Run it with no arguments to be prompted instead, or use
+`consumer/docker-compose.yml`.
+
+`--allow` is the difference between a personal agent and a public one. Without
+it, anyone who texts the number reaches your agent.
+
+### 4. Put the number into relay mode
+
+```bash
+C="python3 /opt/agentcall-sms-consumer/agentcall_sms_consumer.py --config /opt/agentcall-sms-consumer/config.json"
+
+$C configure-number \
+  --number-id num_xxx \
+  --bridge-url https://hermes.your-domain.com \
+  --signing-secret "$AGENTCALL_SIGNING_SECRET" \
+  --allow +15551234567
+```
+
+Read-modify-write against `POST /v1/numbers/:id/inbound-config`, which replaces
+the whole config — it merges onto the current one so your voice setup survives.
+`--dry-run` prints what it would save.
+
+### 5. Verify
+
+```bash
+$C preflight    # config, bridge, push key, API key, brain. Sends nothing.
+$C selftest     # signs a synthetic text and pushes it through the real loop.
+                # No SMS is sent, no real thread is touched.
+$C verify --number +1XXXXXXXXXX
+                # the real one. Text the number; this watches it arrive, get
+                # answered, and reports the latency.
+```
+
+`selftest` covers every hop except the carrier. Only `verify` proves the whole
+thing, so run it last and check your phone for the reply.
+
+### Doing it by prompt
+
+`skill/SKILL.md` is the same procedure written for an agent to follow, with the
+decision table, the failure-mode table, and the traps. Drop it in your agent's
+skill directory and ask:
+
+> Connect this AgentCall number to you for two-way SMS.
+
+### If it does not work
+
+In order, because most reports are one of the first three:
+
+1. Account on Free — relay is processed on Pro.
+2. Number not in relay mode — step 4.
+3. Sender not on the allowlist — add it, or `--allow-anyone`.
+4. `preflight` failing on the push key — the Worker and the consumer disagree.
+5. Text arrives, no reply — the brain. `journalctl -u agentcall-sms-consumer -f`
+   and look for `brain_error`.
+
+Nothing is lost while you debug: the consumer never acks a text it did not
+finish, so anything you fix is retried when the 300s claim expires.
+
 ## Auth model
 
 - **`/agentcall/precall`** uses HMAC-SHA256 signing. AgentCall signs every request with your `AGENTCALL_SIGNING_SECRET`. The Worker rejects requests with a missing or mismatching `X-AgentCall-Signature` header. Constant-time comparison.
@@ -155,10 +277,13 @@ Node, Go, Rust, `requests`, `httpx`, and curl-based clients send their own User-
 ## Tests
 
 ```bash
-npm test
+npm test              # the Worker
+npm run test:consumer  # the consumer (python3, no dependencies)
 ```
 
-80 unit tests cover HMAC verification, all ten endpoints, end-to-end push/pull loops for pre-call, post-call, SMS relay (push → claim → ack), and the action bridge (tool dispatch, notes queue pull → ack), and failure modes (missing signature, bad key, malformed JSON, queue overflow, oversize body, dedicated-secret isolation, per-tenant queueing, message-id dedup, claim visibility + redelivery after expiry, idempotent ack, unknown-tool handling, empty-note no-op, notes-queue eviction).
+80 unit tests cover the Worker: HMAC verification, all eleven endpoints, end-to-end push/pull loops for pre-call, post-call, SMS relay (push → claim → ack), and the action bridge (tool dispatch, notes queue pull → ack), and failure modes (missing signature, bad key, malformed JSON, queue overflow, oversize body, dedicated-secret isolation, per-tenant queueing, message-id dedup, claim visibility + redelivery after expiry, idempotent ack, unknown-tool handling, empty-note no-op, notes-queue eviction).
+
+63 more cover the consumer, most of them on the ack decision — the one that loses a text if it acks too early and double-texts a human if it acks too late. See [consumer/README.md](consumer/README.md#tests).
 
 ## License
 

@@ -1,0 +1,348 @@
+#!/usr/bin/env bash
+#
+# One-command install for the AgentCall SMS relay consumer.
+#
+#   curl -fsSL https://raw.githubusercontent.com/Kintupercy/agentcall-hermes-bridge/main/consumer/install.sh | bash -s -- \
+#     --bridge-url https://hermes.example.com \
+#     --push-key   "$HERMES_PUSH_KEY" \
+#     --api-key    "$AGENTCALL_API_KEY" \
+#     --sms-secret "$AGENTCALL_SMS_SIGNING_SECRET" \
+#     --allow      +15551234567 \
+#     --brain      /opt/agentcall-sms-consumer/brains/hermes_brain.sh
+#
+# Or clone the repo and run ./consumer/install.sh with no arguments to be
+# prompted for each value.
+#
+# What it does:
+#   1. installs the consumer to a prefix (/opt/... as root, ~/.local/... otherwise)
+#   2. writes config.json (world-readable) and consumer.env (0600, secrets)
+#   3. installs a systemd service that restarts forever
+#   4. runs preflight, and tells you what to run next
+#
+# It does NOT touch your AgentCall number unless you pass --number-id. Putting a
+# number into relay mode changes how real texts are handled, so that stays an
+# explicit step.
+
+set -euo pipefail
+
+REPO_RAW="https://raw.githubusercontent.com/Kintupercy/agentcall-hermes-bridge/main/consumer"
+
+BRIDGE_URL=""
+PUSH_KEY=""
+API_KEY=""
+SMS_SECRET=""
+BRAIN=""
+NUMBER_ID=""
+ALLOW=()
+PREFIX=""
+SERVICE_USER=""
+NO_SERVICE=0
+ASSUME_YES=0
+
+say()  { printf '%s\n' "$*"; }
+step() { printf '\n== %s\n' "$*"; }
+warn() { printf 'warning: %s\n' "$*" >&2; }
+die()  { printf 'error: %s\n' "$*" >&2; exit 1; }
+
+usage() {
+  sed -n '3,30p' "$0" | sed 's/^# \{0,1\}//'
+  exit 0
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --bridge-url) BRIDGE_URL="${2:-}"; shift 2 ;;
+    --push-key)   PUSH_KEY="${2:-}"; shift 2 ;;
+    --api-key)    API_KEY="${2:-}"; shift 2 ;;
+    --sms-secret) SMS_SECRET="${2:-}"; shift 2 ;;
+    --brain)      BRAIN="${2:-}"; shift 2 ;;
+    --allow)      ALLOW+=("${2:-}"); shift 2 ;;
+    --number-id)  NUMBER_ID="${2:-}"; shift 2 ;;
+    --prefix)     PREFIX="${2:-}"; shift 2 ;;
+    --user)       SERVICE_USER="${2:-}"; shift 2 ;;
+    --no-service) NO_SERVICE=1; shift ;;
+    --yes|-y)     ASSUME_YES=1; shift ;;
+    --help|-h)    usage ;;
+    *) die "unknown option: $1 (try --help)" ;;
+  esac
+done
+
+# --- prerequisites ----------------------------------------------------------
+
+step "Checking prerequisites"
+
+PYTHON="$(command -v python3 || true)"
+[ -n "$PYTHON" ] || die "python3 is required (3.8 or newer). Install it and re-run."
+PY_OK="$("$PYTHON" -c 'import sys; print(1 if sys.version_info >= (3, 8) else 0)')"
+[ "$PY_OK" = "1" ] || die "python3 3.8 or newer is required (found $("$PYTHON" -V 2>&1))."
+say "  python3   $("$PYTHON" -V 2>&1)"
+
+IS_ROOT=0
+[ "$(id -u)" -eq 0 ] && IS_ROOT=1
+
+if [ -z "$PREFIX" ]; then
+  if [ "$IS_ROOT" -eq 1 ]; then PREFIX="/opt/agentcall-sms-consumer"
+  else PREFIX="$HOME/.local/share/agentcall-sms-consumer"; fi
+fi
+if [ "$IS_ROOT" -eq 1 ]; then
+  ENV_DIR="/etc/agentcall-sms-consumer"
+  STATE_DIR="/var/lib/agentcall-sms-consumer"
+else
+  ENV_DIR="$PREFIX"
+  STATE_DIR="$HOME/.agentcall-sms-consumer"
+fi
+say "  prefix    $PREFIX"
+say "  secrets   $ENV_DIR/consumer.env"
+say "  state     $STATE_DIR"
+
+# --- gather settings --------------------------------------------------------
+
+prompt() { # prompt VAR_NAME "question" [secret]
+  local __var="$1" __q="$2" __secret="${3:-}" __val=""
+  eval "__val=\${$__var}"
+  [ -n "$__val" ] && return 0
+  [ -t 0 ] || die "$__var not set and no terminal to ask on. Pass it as a flag."
+  if [ -n "$__secret" ]; then
+    read -r -s -p "$__q: " __val < /dev/tty; printf '\n'
+  else
+    read -r -p "$__q: " __val < /dev/tty
+  fi
+  eval "$__var=\$__val"
+}
+
+step "Settings"
+say "  You are about to give a phone number the ability to type into your agent."
+say "  Whatever your agent can do, a text message can now attempt: shell commands,"
+say "  spending money, reading files, if those are on the table. The sender"
+say "  allowlist below is a speed bump, not a wall - caller ID is a claim, not a"
+say "  credential. If your agent can execute code or take irreversible actions,"
+say "  put a narrower agent on this channel instead of your full one."
+say "  Details: https://github.com/Kintupercy/agentcall-hermes-bridge/blob/main/consumer/README.md#threat-model"
+say ""
+prompt BRIDGE_URL "Bridge URL (https://hermes.your-domain.com)"
+BRIDGE_URL="${BRIDGE_URL%/}"
+case "$BRIDGE_URL" in
+  https://*) ;;
+  *) die "bridge URL must start with https:// (got '$BRIDGE_URL')" ;;
+esac
+prompt PUSH_KEY   "Worker HERMES_PUSH_KEY" secret
+prompt API_KEY    "AgentCall API key (ac_live_...)" secret
+
+if [ -z "$SMS_SECRET" ] && [ -t 0 ] && [ "$ASSUME_YES" -eq 0 ]; then
+  read -r -s -p "Worker AGENTCALL_SMS_SIGNING_SECRET (blank to skip; needed for selftest): " SMS_SECRET < /dev/tty
+  printf '\n'
+fi
+
+if [ ${#ALLOW[@]} -eq 0 ] && [ -t 0 ] && [ "$ASSUME_YES" -eq 0 ]; then
+  read -r -p "Your phone number, E.164, so only you can reach the agent (blank = anyone): " _allow < /dev/tty
+  [ -n "$_allow" ] && ALLOW+=("$_allow")
+fi
+if [ ${#ALLOW[@]} -eq 0 ]; then
+  warn "no allowlist: ANYONE who texts this number reaches your agent, with"
+  warn "whatever tools it has. Only do this deliberately, for an agent you are"
+  warn "happy to let strangers drive."
+fi
+
+# --- install files ----------------------------------------------------------
+
+step "Installing"
+
+SRC_DIR="$(cd "$(dirname "$0")" && pwd)"
+mkdir -p "$PREFIX/brains" "$ENV_DIR" "$STATE_DIR"
+
+fetch() { # fetch RELATIVE_PATH DEST
+  if [ -f "$SRC_DIR/$1" ]; then
+    cp "$SRC_DIR/$1" "$2"
+  elif command -v curl >/dev/null 2>&1; then
+    curl -fsSL "$REPO_RAW/$1" -o "$2"
+  else
+    die "cannot find $1 locally and curl is not installed"
+  fi
+}
+
+fetch agentcall_sms_consumer.py "$PREFIX/agentcall_sms_consumer.py"
+fetch brains/echo_brain.sh "$PREFIX/brains/echo_brain.sh"
+fetch brains/hermes_brain.sh.example "$PREFIX/brains/hermes_brain.sh.example"
+chmod +x "$PREFIX/agentcall_sms_consumer.py" "$PREFIX/brains/echo_brain.sh"
+say "  installed $PREFIX/agentcall_sms_consumer.py"
+
+if [ -z "$BRAIN" ]; then
+  BRAIN="$PREFIX/brains/echo_brain.sh"
+  warn "no --brain given: using the echo brain, which replies 'Echo: <your text>'."
+  warn "Copy brains/hermes_brain.sh.example to hermes_brain.sh, wire it to your"
+  warn "agent, then set brain.command in $PREFIX/config.json."
+fi
+
+# --- config.json ------------------------------------------------------------
+
+allow_json="[]"
+if [ ${#ALLOW[@]} -gt 0 ]; then
+  allow_json="$(printf '%s\n' "${ALLOW[@]}" | "$PYTHON" -c 'import json,sys; print(json.dumps([l.strip() for l in sys.stdin if l.strip()]))')"
+fi
+
+cat > "$PREFIX/config.json" <<EOF
+{
+  "bridge_url": "$BRIDGE_URL",
+  "agentcall_api_base": "https://api.agentcall.co",
+  "allowed_senders": $allow_json,
+  "brain": {
+    "mode": "command",
+    "command": ["$BRAIN"],
+    "timeout_seconds": 120
+  },
+  "poll_interval_seconds": 2,
+  "history_messages": 20,
+  "max_reply_chars": 1500,
+  "health_port": 0,
+  "state_dir": "$STATE_DIR"
+}
+EOF
+say "  wrote     $PREFIX/config.json"
+
+# --- secrets ----------------------------------------------------------------
+# Written with a restrictive umask rather than chmod-after-write, so the file is
+# never briefly world-readable with a live API key in it.
+
+( umask 077; cat > "$ENV_DIR/consumer.env" <<EOF
+AGENTCALL_BRIDGE_URL=$BRIDGE_URL
+HERMES_PUSH_KEY=$PUSH_KEY
+AGENTCALL_API_KEY=$API_KEY
+AGENTCALL_SMS_SIGNING_SECRET=$SMS_SECRET
+EOF
+)
+chmod 600 "$ENV_DIR/consumer.env"
+say "  wrote     $ENV_DIR/consumer.env (0600)"
+
+# --- service ----------------------------------------------------------------
+
+RUN_CMD="$PYTHON $PREFIX/agentcall_sms_consumer.py --config $PREFIX/config.json"
+
+install_system_service() {
+  local unit=/etc/systemd/system/agentcall-sms-consumer.service
+  local svc_user="${SERVICE_USER:-agentcall}"
+
+  if ! id -u "$svc_user" >/dev/null 2>&1; then
+    useradd --system --no-create-home --shell /usr/sbin/nologin "$svc_user" \
+      || die "could not create service user '$svc_user' (pass --user <existing-user>)"
+    say "  created   service user $svc_user"
+  fi
+  chown -R "$svc_user":"$svc_user" "$STATE_DIR" "$PREFIX"
+  chown "$svc_user":"$svc_user" "$ENV_DIR/consumer.env"
+
+  cat > "$unit" <<EOF
+[Unit]
+Description=AgentCall SMS relay consumer (bridge -> your agent -> reply)
+Documentation=https://github.com/Kintupercy/agentcall-hermes-bridge
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=$RUN_CMD run
+WorkingDirectory=$PREFIX
+EnvironmentFile=$ENV_DIR/consumer.env
+Environment=PYTHONUNBUFFERED=1
+User=$svc_user
+Group=$svc_user
+Restart=always
+RestartSec=5
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=agentcall-sms
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  systemctl daemon-reload
+  systemctl enable --now agentcall-sms-consumer >/dev/null
+  say "  service   agentcall-sms-consumer enabled and started"
+}
+
+install_user_service() {
+  local dir="$HOME/.config/systemd/user"
+  mkdir -p "$dir"
+  cat > "$dir/agentcall-sms-consumer.service" <<EOF
+[Unit]
+Description=AgentCall SMS relay consumer
+After=network-online.target
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=$RUN_CMD run
+WorkingDirectory=$PREFIX
+EnvironmentFile=$ENV_DIR/consumer.env
+Environment=PYTHONUNBUFFERED=1
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+EOF
+  systemctl --user daemon-reload
+  systemctl --user enable --now agentcall-sms-consumer >/dev/null
+  say "  service   agentcall-sms-consumer enabled and started (user scope)"
+  # Without lingering, the service dies when this login session ends, which
+  # looks exactly like "it worked yesterday and stopped overnight".
+  if command -v loginctl >/dev/null 2>&1 && \
+     [ "$(loginctl show-user "$USER" -p Linger --value 2>/dev/null)" != "yes" ]; then
+    warn "user services stop when you log out. Run: sudo loginctl enable-linger $USER"
+  fi
+}
+
+step "Service"
+if [ "$NO_SERVICE" -eq 1 ]; then
+  say "  skipped (--no-service). Run it yourself with:"
+  say "    $RUN_CMD run"
+elif ! command -v systemctl >/dev/null 2>&1; then
+  warn "systemd not found. Use Docker (consumer/docker-compose.yml) or run:"
+  say "    $RUN_CMD run"
+elif [ "$IS_ROOT" -eq 1 ]; then
+  install_system_service
+else
+  install_user_service
+fi
+
+# --- verify -----------------------------------------------------------------
+
+step "Preflight"
+set -a
+# shellcheck disable=SC1090
+. "$ENV_DIR/consumer.env"
+set +a
+PREFLIGHT_RC=0
+$RUN_CMD preflight || PREFLIGHT_RC=$?
+
+# --- optional: put the number into relay mode -------------------------------
+
+if [ -n "$NUMBER_ID" ]; then
+  step "Configuring $NUMBER_ID for relay"
+  configure_args=(configure-number --number-id "$NUMBER_ID" --bridge-url "$BRIDGE_URL")
+  [ -n "$SMS_SECRET" ] && configure_args+=(--signing-secret "$SMS_SECRET")
+  for a in "${ALLOW[@]:-}"; do [ -n "$a" ] && configure_args+=(--allow "$a"); done
+  $RUN_CMD "${configure_args[@]}" || warn "could not configure the number; run it by hand (see below)."
+fi
+
+# --- what next --------------------------------------------------------------
+
+step "Next"
+say "  status      $RUN_CMD status"
+say "  logs        journalctl -u agentcall-sms-consumer -f"
+say "  selftest    $RUN_CMD selftest         # signed synthetic text, no SMS sent"
+say "  live test   $RUN_CMD verify --number +1XXXXXXXXXX"
+if [ -z "$NUMBER_ID" ]; then
+  say ""
+  say "  The number is not in relay mode yet. When you are ready:"
+  say "    $RUN_CMD configure-number --number-id num_xxx \\"
+  say "      --bridge-url $BRIDGE_URL --signing-secret <worker sms secret> \\"
+  say "      --allow +1XXXXXXXXXX"
+fi
+say ""
+if [ "$PREFLIGHT_RC" -ne 0 ]; then
+  say "Installed, but preflight found problems (above). Fix those before testing."
+  exit "$PREFLIGHT_RC"
+fi
+say "Installed and running."
