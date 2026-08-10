@@ -1,0 +1,26 @@
+{
+  "_comment": "Non-secret settings. Secrets belong in the environment file (see consumer.env.example) so this file can stay world-readable. Any value here is overridden by its environment variable.",
+
+  "bridge_url": "https://hermes.YOUR-DOMAIN.com",
+  "agentcall_api_base": "https://api.agentcall.co",
+
+  "_allowed_senders": "Lock a personal agent to yourself. AgentCall also enforces this server-side via the number's allowedSenders; this is the second lock. Empty list = anyone who texts the number reaches your agent.",
+  "allowed_senders": ["+15551234567"],
+
+  "_brain": "How the consumer asks your agent for a reply. mode 'command' pipes JSON to stdin and reads the reply from stdout (exit 64 = deliberately say nothing). mode 'http' POSTs the same JSON and expects {\"reply\": \"...\"}.",
+  "brain": {
+    "mode": "command",
+    "command": ["/opt/agentcall-sms-consumer/brains/hermes_brain.sh"],
+    "timeout_seconds": 120
+  },
+
+  "poll_interval_seconds": 2,
+  "history_messages": 20,
+  "max_reply_chars": 1500,
+  "http_timeout_seconds": 20,
+
+  "_health_port": "0 disables the health endpoint. Set it (8787) for the Docker healthcheck or an external probe.",
+  "health_port": 0,
+
+  "state_dir": "/var/lib/agentcall-sms-consumer"
+}

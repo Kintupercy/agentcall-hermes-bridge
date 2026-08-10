@@ -1,0 +1,57 @@
+# Run the consumer next to your agent.
+#
+#   cp consumer.env.example consumer.env   # fill in the secrets
+#   cp config.example.json config.json     # bridge URL, allowlist, brain
+#   docker compose up -d
+#   docker compose exec consumer python3 /app/agentcall_sms_consumer.py \
+#     --config /app/config.json preflight
+#
+# If your agent runs in its own container, put both on the same network and
+# point brain.url at it (http mode), or exec into it from a command brain.
+
+services:
+  consumer:
+    build: .
+    image: agentcall-sms-consumer:latest
+    container_name: agentcall-sms-consumer
+
+    env_file:
+      - consumer.env
+    environment:
+      AGENTCALL_CONSUMER_CONFIG: /app/config.json
+
+    volumes:
+      - ./config.json:/app/config.json:ro
+      # Your brain. Keep it outside the image so you can edit it without a
+      # rebuild.
+      - ./brains:/app/brains:ro
+      # State must survive a restart: it holds the set of message ids already
+      # answered, which is what stops a redelivered text being answered twice.
+      - consumer-state:/var/lib/agentcall-sms-consumer
+
+    # Claim/ack means a restart mid-message is safe: anything claimed but not
+    # acked is redelivered when the 300s visibility window expires.
+    restart: unless-stopped
+
+    # The health endpoint (AGENTCALL_HEALTH_PORT=8787, set in the image) goes
+    # 503 when polls stop landing, so a wedged consumer gets restarted instead
+    # of sitting there looking alive while texts queue on the bridge.
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8787/healthz"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+
+    # Uncomment to probe health from the host.
+    # ports:
+    #   - "127.0.0.1:8787:8787"
+
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  consumer-state:

@@ -1,0 +1,55 @@
+[Unit]
+Description=AgentCall SMS relay consumer (bridge -> your agent -> reply)
+Documentation=https://github.com/Kintupercy/agentcall-hermes-bridge
+Documentation=https://agentcall.co/docs/agent-sms
+After=network-online.target
+Wants=network-online.target
+# Do not give up restarting. A bridge outage or a dead brain would otherwise
+# trip the default burst limit, systemd would stop trying, and texts would sit
+# queued with nobody paged.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/env python3 /opt/agentcall-sms-consumer/agentcall_sms_consumer.py --config /opt/agentcall-sms-consumer/config.json run
+WorkingDirectory=/opt/agentcall-sms-consumer
+
+# Secrets live here, mode 0600, owned by the service user. Never in the unit
+# file, which is world-readable.
+EnvironmentFile=/etc/agentcall-sms-consumer/consumer.env
+
+User=agentcall
+Group=agentcall
+
+# The claim/ack protocol means a restart never loses a text: anything claimed
+# but not acked comes back when the 300s visibility window expires.
+Restart=always
+RestartSec=5
+
+# Unbuffered so `journalctl -f` shows the JSON log lines as they happen instead
+# of in 4KB bursts.
+Environment=PYTHONUNBUFFERED=1
+
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=agentcall-sms
+
+# State (counters + the replied-message set that stops a redelivery becoming a
+# duplicate text) lives under /var/lib/agentcall-sms-consumer.
+StateDirectory=agentcall-sms-consumer
+
+# Hardening. The consumer needs outbound HTTPS, its state directory, and
+# whatever the brain command needs. Loosen these if your brain does more.
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+
+[Install]
+WantedBy=multi-user.target

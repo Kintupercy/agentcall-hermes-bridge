@@ -1,0 +1,77 @@
+#!/bin/sh
+# Template: hand the text to your real agent and print its answer.
+#
+# Copy to hermes_brain.sh, edit the AGENT step, chmod +x, and point config.json
+# at it. This is the only file you should need to write yourself — everything
+# else in this directory is generic.
+#
+# stdin: the relay payload (see echo_brain.sh for the shape)
+# stdout: the reply text, nothing else. Anything you print here is texted to a
+#         human, so send logs to stderr.
+#
+# exit 0  -> stdout is the reply
+# exit 64 -> deliberately say nothing (the text is acked, nothing is sent)
+# else    -> failure; the text is redelivered and tried again
+
+set -eu
+
+payload=$(cat)
+
+# --- extract what your agent needs -----------------------------------------
+# jq if you have it, python3 as the fallback (the consumer already requires it).
+if command -v jq >/dev/null 2>&1; then
+  body=$(printf '%s' "$payload" | jq -r '.message.body // ""')
+  sender=$(printf '%s' "$payload" | jq -r '.message.from // ""')
+  thread=$(printf '%s' "$payload" | jq -r '.conversation.id // ""')
+  history=$(printf '%s' "$payload" | jq -r '.history[]? | "\(.direction): \(.body)"')
+else
+  # python3 is already a hard requirement of the consumer, so it is always here.
+  # Keep these scripts single-quoted end to end: nesting double quotes inside a
+  # double-quoted -c is where this kind of one-liner usually breaks.
+  body=$(printf '%s' "$payload" | python3 -c 'import json,sys;print(json.load(sys.stdin)["message"]["body"])')
+  sender=$(printf '%s' "$payload" | python3 -c 'import json,sys;print(json.load(sys.stdin)["message"]["from"])')
+  thread=$(printf '%s' "$payload" | python3 -c 'import json,sys;print(json.load(sys.stdin)["conversation"]["id"])')
+  history=$(printf '%s' "$payload" | python3 -c 'import json,sys;print(chr(10).join((m.get("direction") or "")+": "+(m.get("body") or "") for m in json.load(sys.stdin).get("history",[])))')
+fi
+
+# selftest payloads carry "selftest": true and a conversation id that does not
+# exist. Answer them normally; the consumer knows never to text anyone for one.
+
+# --- ask your agent ---------------------------------------------------------
+# Replace this block. Whatever you run must print the reply on stdout and
+# finish inside brain.timeout_seconds (default 120s).
+#
+# Hermes over its local HTTP API:
+#   reply=$(curl -sS --max-time 110 http://127.0.0.1:8080/v1/chat \
+#             -H 'Content-Type: application/json' \
+#             -d "$(jq -n --arg t "$thread" --arg m "$body" \
+#                   '{session:$t, message:$m}')" | jq -r '.reply')
+#
+# Hermes over a CLI in a container:
+#   reply=$(docker exec -i hermes hermes chat --session "$thread" --message "$body")
+#
+# Anything else that reads a prompt and prints an answer works too.
+
+prompt="A text arrived from ${sender} in thread ${thread}.
+
+Recent thread:
+${history}
+
+New message:
+${body}
+
+Answer as yourself, in one or two sentences. This is SMS, so keep it short."
+
+reply=$(printf '%s' "$prompt" | your-agent-command-here) || {
+  echo "agent failed" >&2
+  exit 1
+}
+
+# --- guard rails ------------------------------------------------------------
+# An empty reply with exit 0 is treated as an error by the consumer (a text
+# would be silently swallowed), so be explicit about saying nothing.
+if [ -z "$(printf '%s' "$reply" | tr -d '[:space:]')" ]; then
+  exit 64
+fi
+
+printf '%s' "$reply"
