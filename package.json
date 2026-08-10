@@ -1,6 +1,6 @@
 {
   "name": "agentcall-hermes-bridge",
-  "version": "0.4.0",
+  "version": "0.4.0-beta.1",
   "description": "Cloudflare Worker + local consumer that bridge AgentCall to your AI agent platform. Pre-call: serves today's brief on inbound calls. Post-call: queues transcripts for the agent to pull. Two-way SMS: relays inbound texts to your own agent and sends its replies in-thread. See https://agentcall.co/docs/hermes, https://agentcall.co/docs/post-call-webhook, and https://agentcall.co/docs/agent-sms.",
   "type": "module",
   "license": "MIT",
